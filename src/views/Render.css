@@ -12,114 +12,27 @@ html:has(.render) body {
   font-style: normal;
 }
 
-.render {
+/* Full-bleed game surface — the rink fills the entire screen. */
+.render--game {
   position: relative;
   flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 2rem;
-  padding: 3rem;
+  display: block;
+  padding: 0;
+  margin: 0;
   overflow: hidden;
-  font-family: "Inter", sans-serif;
-  color: #ffffff;
   background: #000000;
+  /* Block browser touch gestures (scroll/zoom) so multi-touch reaches the canvas. */
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
-.render--comfortable {
-  gap: 1.5rem;
-  padding: 2.5rem;
-}
-
-.render--compact {
-  gap: 1rem;
-  padding: 2rem;
-}
-
-.render--minimal {
-  gap: 0.6rem;
-  padding: 1.5rem;
-}
-
-.render__logo {
-  width: 30rem;
-  max-width: 50%;
-}
-
-.render--comfortable .render__logo {
-  width: 25rem;
-}
-
-.render--compact .render__logo {
-  width: 20rem;
-}
-
-.render--minimal .render__logo {
-  width: 15rem;
-}
-
-.render__hero {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2rem;
-}
-
-.render--compact .render__hero,
-.render--minimal .render__hero {
-  gap: 1rem;
-}
-
-.render__hero-title {
-  font-size: 5rem;
-  font-weight: 600;
-  text-align: center;
-}
-
-.render--comfortable .render__hero-title {
-  font-size: 4rem;
-}
-
-.render--compact .render__hero-title {
-  font-size: 3rem;
-}
-
-.render--minimal .render__hero-title {
-  font-size: 2.5rem;
-}
-
-.render__docs-information {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2rem;
-}
-
-.render--compact .render__docs-information,
-.render--minimal .render__docs-information {
-  gap: 1rem;
-}
-
-.render__docs-information-title {
-  font-size: 2rem;
-  font-weight: 600;
-  text-align: center;
-}
-
-.render__docs-information-text {
-  font-size: 2rem;
-  max-width: 60rem;
-  text-align: center;
-  color: #cccccc;
-}
-
-.render--comfortable .render__docs-information-title,
-.render--comfortable .render__docs-information-text {
-  font-size: 1.6rem;
-}
-
-.render--compact .render__docs-information-title,
-.render--compact .render__docs-information-text {
-  font-size: 1.4rem;
+.air-hockey-canvas {
+  display: block;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
 }

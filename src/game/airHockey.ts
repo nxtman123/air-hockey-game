@@ -1,0 +1,750 @@
+/**
+ * Air Hockey — two-player, multi-touch, physics-driven game.
+ *
+ * Rendering and input live on a single full-viewport <canvas>; physics is run by
+ * matter-js (zero-gravity top-down table). The rink is a rounded-corner white
+ * "ice" sheet; everything outside the rink is black. Classic hockey line colors
+ * (red center line + goal lines, blue zone lines) mark the ice. The two teams are
+ * RED (Player 1) and BLUE (Player 2).
+ *
+ * Layout adapts to orientation:
+ *   - landscape → goals on the LEFT (RED) and RIGHT (BLUE) edges, vertical center line
+ *   - portrait  → goals on the BOTTOM (RED) and TOP (BLUE) edges, horizontal center line
+ *
+ * The scoreboard and countdown are rendered double-sided (rotated copies) so they
+ * can be read from both ends of the rink. The puck is never auto-launched: at each
+ * face-off it sits still inside the receiving player's half until a paddle strikes
+ * it, and if it comes to rest it stays at rest. First to WIN_SCORE wins.
+ */
+
+import Matter from 'matter-js'
+
+const { Engine, Bodies, Body, Composite } = Matter
+
+// ── Tunables ─────────────────────────────────────────────────────────────────
+const WIN_SCORE = 3
+const PHYS_DT = 1000 / 60 // fixed physics step (ms)
+const COUNTDOWN_MS = 1500 // pre-play countdown (3 → 2 → 1)
+const STUCK_MS = 2000 // re-face-off if the puck idles in the unreachable neutral band
+
+// Team / rink palette
+const RED = '#e23b3b' // Player 1
+const BLUE = '#2f6bff' // Player 2
+const ICE = '#ffffff'
+const OUTSIDE = '#000000'
+const RED_LINE = '#d11f2a'
+const BLUE_LINE = '#1f47d1'
+const BOARDS = '#0e1726'
+const PUCK_COLOR = '#101418'
+
+type Phase = 'countdown' | 'playing' | 'gameover'
+
+interface Geo {
+  W: number
+  H: number
+  portrait: boolean
+  rBase: number
+  // playfield (ice) rectangle
+  left: number
+  top: number
+  right: number
+  bottom: number
+  pw: number
+  ph: number
+  cx: number
+  cy: number
+  cornerR: number
+  puckR: number
+  paddleR: number
+  wall: number
+  goalLen: number
+}
+
+interface Placement {
+  x: number
+  y: number
+  angle: number
+}
+
+export interface AirHockeyController {
+  resize(): void
+  reset(): void
+  destroy(): void
+  getState(): { scores: [number, number]; phase: Phase; winner: number; portrait: boolean }
+  debugSetScore(p1: number, p2: number): void
+}
+
+const clamp = (v: number, min: number, max: number) => (v < min ? min : v > max ? max : v)
+
+function roundRectPath(c: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+  const rr = Math.min(r, w / 2, h / 2)
+  c.beginPath()
+  c.moveTo(x + rr, y)
+  c.arcTo(x + w, y, x + w, y + h, rr)
+  c.arcTo(x + w, y + h, x, y + h, rr)
+  c.arcTo(x, y + h, x, y, rr)
+  c.arcTo(x, y, x + w, y, rr)
+  c.closePath()
+}
+
+export function createAirHockey(
+  canvas: HTMLCanvasElement,
+  logo: HTMLImageElement,
+): AirHockeyController {
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('2D canvas context unavailable')
+
+  const engine = Engine.create()
+  engine.gravity.x = 0
+  engine.gravity.y = 0
+
+  let geo: Geo = computeGeo()
+  let puck: Matter.Body
+  let paddles: Matter.Body[] = []
+
+  const scores: [number, number] = [0, 0]
+  let phase: Phase = 'countdown'
+  let phaseTimer = COUNTDOWN_MS
+  let serveToward: 0 | 1 = 0 // half the puck is faced-off into (the receiver)
+  let winner = -1
+  let slowTimer = 0
+
+  // paddle finger targets (null = released); one pointer owns one paddle
+  const targets: (Matter.Vector | null)[] = [null, null]
+  const pointerOwner = new Map<number, number>()
+
+  // ── geometry ────────────────────────────────────────────────────────────────
+  function computeGeo(): Geo {
+    const dpr = window.devicePixelRatio || 1
+    const W = canvas.clientWidth || 1
+    const H = canvas.clientHeight || 1
+    canvas.width = Math.max(1, Math.round(W * dpr))
+    canvas.height = Math.max(1, Math.round(H * dpr))
+    ctx!.setTransform(dpr, 0, 0, dpr, 0, 0)
+    const rBase = Math.min(W, H)
+    const portrait = H > W
+    const margin = rBase * 0.025
+    const left = margin
+    const top = margin
+    const right = W - margin
+    const bottom = H - margin
+    const pw = right - left
+    const ph = bottom - top
+    return {
+      W,
+      H,
+      portrait,
+      rBase,
+      left,
+      top,
+      right,
+      bottom,
+      pw,
+      ph,
+      cx: (left + right) / 2,
+      cy: (top + bottom) / 2,
+      cornerR: rBase * 0.11,
+      puckR: rBase * 0.03,
+      paddleR: rBase * 0.058,
+      wall: rBase * 0.045,
+      goalLen: (portrait ? pw : ph) * 0.34,
+    }
+  }
+
+  function homePos(i: number): Matter.Vector {
+    const { left, right, top, bottom, cx, cy, pw, ph, portrait } = geo
+    if (!portrait) return i === 0 ? { x: left + pw * 0.22, y: cy } : { x: right - pw * 0.22, y: cy }
+    // portrait: P1 bottom, P2 top
+    return i === 0 ? { x: cx, y: bottom - ph * 0.22 } : { x: cx, y: top + ph * 0.22 }
+  }
+
+  // stationary face-off point inside the receiving player's half (reachable by them)
+  function faceoffPoint(side: 0 | 1): Matter.Vector {
+    const { left, top, pw, ph, cx, cy, portrait } = geo
+    if (!portrait) return { x: side === 0 ? left + pw * 0.25 : left + pw * 0.75, y: cy }
+    return { x: cx, y: side === 0 ? top + ph * 0.75 : top + ph * 0.25 }
+  }
+
+  // restrict paddle i to its half (kept paddleR away from edges & center line)
+  function clampToHalf(i: number, x: number, y: number): Matter.Vector {
+    const { left, right, top, bottom, cx, cy, portrait, paddleR: r } = geo
+    let nx = x
+    let ny = y
+    if (!portrait) {
+      ny = clamp(ny, top + r, bottom - r)
+      nx = i === 0 ? clamp(nx, left + r, cx - r) : clamp(nx, cx + r, right - r)
+    } else {
+      nx = clamp(nx, left + r, right - r)
+      ny = i === 0 ? clamp(ny, cy + r, bottom - r) : clamp(ny, top + r, cy - r)
+    }
+    return { x: nx, y: ny }
+  }
+
+  // which paddle owns a touch at (x,y)
+  function halfAt(x: number, y: number): number {
+    if (!geo.portrait) return x < geo.cx ? 0 : 1
+    return y > geo.cy ? 0 : 1
+  }
+
+  // ── world construction ────────────────────────────────────────────────────
+  function buildWorld() {
+    Composite.clear(engine.world, false, true)
+    const { left, right, top, bottom, pw, ph, cx, cy, wall: t, goalLen } = geo
+    const half = t / 2
+    const walls: Matter.Body[] = []
+    const addWall = (wx: number, wy: number, w: number, h: number) => {
+      walls.push(Bodies.rectangle(wx, wy, w, h, { isStatic: true, restitution: 1, friction: 0 }))
+    }
+
+    if (!geo.portrait) {
+      // solid top & bottom; goal mouths centered on left & right edges
+      addWall(cx, top - half, pw + t * 2, t)
+      addWall(cx, bottom + half, pw + t * 2, t)
+      const seg = (ph - goalLen) / 2
+      addWall(left - half, top + seg / 2, t, seg)
+      addWall(left - half, bottom - seg / 2, t, seg)
+      addWall(right + half, top + seg / 2, t, seg)
+      addWall(right + half, bottom - seg / 2, t, seg)
+    } else {
+      // solid left & right; goal mouths centered on top & bottom edges
+      addWall(left - half, cy, t, ph + t * 2)
+      addWall(right + half, cy, t, ph + t * 2)
+      const seg = (pw - goalLen) / 2
+      addWall(left + seg / 2, top - half, seg, t)
+      addWall(right - seg / 2, top - half, seg, t)
+      addWall(left + seg / 2, bottom + half, seg, t)
+      addWall(right - seg / 2, bottom + half, seg, t)
+    }
+    Composite.add(engine.world, walls)
+
+    const fo = faceoffPoint(serveToward)
+    puck = Bodies.circle(fo.x, fo.y, geo.puckR, {
+      restitution: 0.98,
+      friction: 0,
+      frictionStatic: 0,
+      frictionAir: 0.006,
+      density: 0.002,
+    })
+    Composite.add(engine.world, puck)
+
+    paddles = [0, 1].map((i) =>
+      Bodies.circle(homePos(i).x, homePos(i).y, geo.paddleR, {
+        restitution: 0.4,
+        friction: 0,
+        frictionAir: 0.2,
+        density: 0.05, // heavy vs. puck so it barely recoils
+      }),
+    )
+    Composite.add(engine.world, paddles)
+  }
+
+  // ── match flow ──────────────────────────────────────────────────────────────
+  // Face-off: drop the puck STILL into a half. It only moves once struck.
+  function resetPuck(toward: 0 | 1) {
+    const fo = faceoffPoint(toward)
+    Body.setPosition(puck, fo)
+    Body.setVelocity(puck, { x: 0, y: 0 })
+    Body.setAngularVelocity(puck, 0)
+    serveToward = toward
+    phase = 'countdown'
+    phaseTimer = COUNTDOWN_MS
+    slowTimer = 0
+  }
+
+  function onGoal(scorer: number) {
+    scores[scorer]++
+    if (scores[scorer] >= WIN_SCORE) {
+      winner = scorer
+      phase = 'gameover'
+      Body.setPosition(puck, { x: geo.cx, y: geo.cy })
+      Body.setVelocity(puck, { x: 0, y: 0 })
+    } else {
+      resetPuck((1 - scorer) as 0 | 1) // face off toward the player who conceded
+    }
+  }
+
+  function checkGoals() {
+    const { left, right, top, bottom, cx, cy, goalLen, puckR } = geo
+    const { x, y } = puck.position
+    let scorer = -1
+    if (!geo.portrait) {
+      const inMouth = Math.abs(y - cy) < goalLen / 2
+      if (x < left - puckR && inMouth) scorer = 1 // into left (RED) goal → BLUE scores
+      else if (x > right + puckR && inMouth) scorer = 0 // into right (BLUE) goal → RED scores
+    } else {
+      const inMouth = Math.abs(x - cx) < goalLen / 2
+      if (y > bottom + puckR && inMouth) scorer = 1 // into bottom (RED) goal → BLUE scores
+      else if (y < top - puckR && inMouth) scorer = 0 // into top (BLUE) goal → RED scores
+    }
+    if (scorer >= 0) {
+      onGoal(scorer)
+      return
+    }
+    // failsafe: puck escaped without a valid goal — face off again
+    if (x < left - geo.pw * 0.2 || x > right + geo.pw * 0.2 || y < top - geo.ph * 0.2 || y > bottom + geo.ph * 0.2) {
+      resetPuck(serveToward)
+    }
+  }
+
+  // If the puck stalls in the central band that NO paddle can reach, gently re-face-off
+  // it (still — never relaunched at speed). A stalled puck elsewhere is left for a player to hit.
+  function checkStuck() {
+    const sp = Math.hypot(puck.velocity.x, puck.velocity.y)
+    const band = geo.paddleR + geo.puckR
+    const inNeutral = !geo.portrait
+      ? Math.abs(puck.position.x - geo.cx) < band
+      : Math.abs(puck.position.y - geo.cy) < band
+    if (sp < geo.rBase * 0.0025 && inNeutral) {
+      slowTimer += PHYS_DT
+      if (slowTimer > STUCK_MS) resetPuck(((serveToward + 1) % 2) as 0 | 1)
+    } else {
+      slowTimer = 0
+    }
+  }
+
+  function reset() {
+    scores[0] = 0
+    scores[1] = 0
+    winner = -1
+    paddles.forEach((p, i) => {
+      Body.setPosition(p, homePos(i))
+      Body.setVelocity(p, { x: 0, y: 0 })
+    })
+    targets[0] = null
+    targets[1] = null
+    resetPuck(serveToward)
+  }
+
+  // ── per-frame simulation ────────────────────────────────────────────────────
+  function step() {
+    if (phase === 'countdown') {
+      phaseTimer -= PHYS_DT
+      if (phaseTimer <= 0) phase = 'playing' // puck stays put; players must strike it
+    }
+
+    // velocity-chase paddles toward fingers
+    for (let i = 0; i < 2; i++) {
+      const p = paddles[i]
+      const tgt = targets[i]
+      if (tgt && phase !== 'gameover') {
+        let vx = (tgt.x - p.position.x) * 0.4
+        let vy = (tgt.y - p.position.y) * 0.4
+        const maxv = geo.rBase * 0.05
+        const sp = Math.hypot(vx, vy)
+        if (sp > maxv) {
+          vx = (vx / sp) * maxv
+          vy = (vy / sp) * maxv
+        }
+        Body.setVelocity(p, { x: vx, y: vy })
+      } else {
+        Body.setVelocity(p, { x: 0, y: 0 })
+      }
+    }
+
+    Engine.update(engine, PHYS_DT)
+
+    // keep paddles inside their halves even after puck impacts
+    for (let i = 0; i < 2; i++) {
+      const p = paddles[i]
+      const c = clampToHalf(i, p.position.x, p.position.y)
+      if (c.x !== p.position.x || c.y !== p.position.y) Body.setPosition(p, c)
+    }
+
+    // cap puck speed to prevent tunneling through rails / goal posts
+    const ps = Math.hypot(puck.velocity.x, puck.velocity.y)
+    const maxp = geo.rBase * 0.03
+    if (ps > maxp) {
+      Body.setVelocity(puck, { x: (puck.velocity.x / ps) * maxp, y: (puck.velocity.y / ps) * maxp })
+    }
+
+    if (phase === 'playing') {
+      checkGoals()
+      checkStuck()
+    }
+  }
+
+  // ── rendering ────────────────────────────────────────────────────────────────
+  function draw() {
+    const c = ctx!
+    const { W, H, left, top, pw, ph, cornerR } = geo
+
+    // everything outside the rink is black
+    c.fillStyle = OUTSIDE
+    c.fillRect(0, 0, W, H)
+
+    // white ice with rounded corners
+    roundRectPath(c, left, top, pw, ph, cornerR)
+    c.fillStyle = ICE
+    c.fill()
+
+    // markings + goals + logo clipped to the ice
+    c.save()
+    roundRectPath(c, left, top, pw, ph, cornerR)
+    c.clip()
+    drawMarkings()
+    drawGoals()
+    drawLogo()
+    c.restore()
+
+    // boards (rounded rail)
+    c.save()
+    roundRectPath(c, left, top, pw, ph, cornerR)
+    c.strokeStyle = BOARDS
+    c.lineWidth = geo.wall * 0.6
+    c.stroke()
+    c.restore()
+
+    drawPuck()
+    drawPaddle(0, RED)
+    drawPaddle(1, BLUE)
+    drawScoreboard()
+
+    if (phase === 'countdown') drawCountdown()
+    else if (phase === 'gameover') drawWinner()
+  }
+
+  function drawMarkings() {
+    const c = ctx!
+    const { left, right, top, bottom, cx, cy, pw, ph, rBase, portrait } = geo
+    const lw = Math.max(2, rBase * 0.01)
+    c.lineWidth = lw
+
+    if (!portrait) {
+      // blue zone lines
+      c.strokeStyle = BLUE_LINE
+      for (const x of [cx - pw * 0.17, cx + pw * 0.17]) {
+        c.beginPath()
+        c.moveTo(x, top)
+        c.lineTo(x, bottom)
+        c.stroke()
+      }
+      // red goal lines
+      c.strokeStyle = RED_LINE
+      c.lineWidth = lw * 0.7
+      for (const x of [left + pw * 0.05, right - pw * 0.05]) {
+        c.beginPath()
+        c.moveTo(x, top)
+        c.lineTo(x, bottom)
+        c.stroke()
+      }
+      // red center line
+      c.lineWidth = lw * 1.4
+      c.beginPath()
+      c.moveTo(cx, top)
+      c.lineTo(cx, bottom)
+      c.stroke()
+    } else {
+      c.strokeStyle = BLUE_LINE
+      for (const y of [cy - ph * 0.17, cy + ph * 0.17]) {
+        c.beginPath()
+        c.moveTo(left, y)
+        c.lineTo(right, y)
+        c.stroke()
+      }
+      c.strokeStyle = RED_LINE
+      c.lineWidth = lw * 0.7
+      for (const y of [top + ph * 0.05, bottom - ph * 0.05]) {
+        c.beginPath()
+        c.moveTo(left, y)
+        c.lineTo(right, y)
+        c.stroke()
+      }
+      c.lineWidth = lw * 1.4
+      c.beginPath()
+      c.moveTo(left, cy)
+      c.lineTo(right, cy)
+      c.stroke()
+    }
+
+    // clean white face-off spot so the logo reads clearly over the lines
+    c.beginPath()
+    c.arc(cx, cy, rBase * 0.16, 0, Math.PI * 2)
+    c.fillStyle = ICE
+    c.fill()
+    // center face-off ring (red)
+    c.strokeStyle = RED_LINE
+    c.lineWidth = lw
+    c.beginPath()
+    c.arc(cx, cy, rBase * 0.16, 0, Math.PI * 2)
+    c.stroke()
+  }
+
+  function drawGoals() {
+    const { left, right, top, bottom, cx, cy, goalLen, wall: t } = geo
+    if (!geo.portrait) {
+      paintGoal(left, cy - goalLen / 2, t, goalLen, RED)
+      paintGoal(right - t, cy - goalLen / 2, t, goalLen, BLUE)
+    } else {
+      paintGoal(cx - goalLen / 2, bottom - t, goalLen, t, RED)
+      paintGoal(cx - goalLen / 2, top, goalLen, t, BLUE)
+    }
+  }
+
+  function paintGoal(x: number, y: number, w: number, h: number, color: string) {
+    const c = ctx!
+    c.save()
+    c.fillStyle = color
+    c.shadowColor = color
+    c.shadowBlur = geo.rBase * 0.045
+    c.fillRect(x, y, w, h)
+    c.restore()
+  }
+
+  function drawLogo() {
+    if (!(logo.complete && logo.naturalWidth > 0)) return
+    const c = ctx!
+    const size = geo.rBase * 0.27
+    c.drawImage(logo, geo.cx - size / 2, geo.cy - size / 2, size, size) // fully opaque
+  }
+
+  function drawPuck() {
+    const c = ctx!
+    c.save()
+    c.beginPath()
+    c.arc(puck.position.x, puck.position.y, geo.puckR, 0, Math.PI * 2)
+    c.fillStyle = PUCK_COLOR
+    c.shadowColor = 'rgba(0,0,0,0.35)'
+    c.shadowBlur = geo.puckR * 0.6
+    c.fill()
+    c.restore()
+  }
+
+  function drawPaddle(i: number, color: string) {
+    const c = ctx!
+    const p = paddles[i]
+    const r = geo.paddleR
+    c.save()
+    c.beginPath()
+    c.arc(p.position.x, p.position.y, r, 0, Math.PI * 2)
+    const grad = c.createRadialGradient(p.position.x, p.position.y, r * 0.2, p.position.x, p.position.y, r)
+    grad.addColorStop(0, '#ffffff')
+    grad.addColorStop(0.4, color)
+    grad.addColorStop(1, color)
+    c.fillStyle = grad
+    c.shadowColor = 'rgba(0,0,0,0.35)'
+    c.shadowBlur = r * 0.4
+    c.fill()
+    c.beginPath()
+    c.arc(p.position.x, p.position.y, r * 0.42, 0, Math.PI * 2)
+    c.fillStyle = color
+    c.fill()
+    c.restore()
+  }
+
+  // ── double-sided overlays (readable from both ends) ──────────────────────────
+  // Rotations face each player at the end of the rink behind their goal.
+  function scoreboardPlacements(): Placement[] {
+    const { left, right, top, bottom, cx, cy, pw, ph, portrait } = geo
+    if (!portrait) {
+      return [
+        { x: left + pw * 0.1, y: top + ph * 0.16, angle: Math.PI / 2 }, // RED end (left)
+        { x: right - pw * 0.1, y: top + ph * 0.16, angle: -Math.PI / 2 }, // BLUE end (right)
+      ]
+    }
+    return [
+      { x: right - pw * 0.16, y: top + ph * 0.08, angle: Math.PI }, // BLUE end (top)
+      { x: left + pw * 0.16, y: bottom - ph * 0.08, angle: 0 }, // RED end (bottom)
+    ]
+  }
+
+  function countdownPlacements(): Placement[] {
+    const { cx, cy, rBase, portrait } = geo
+    const d = rBase * 0.2
+    if (!portrait) {
+      return [
+        { x: cx - d, y: cy, angle: Math.PI / 2 }, // faces RED end (left)
+        { x: cx + d, y: cy, angle: -Math.PI / 2 }, // faces BLUE end (right)
+      ]
+    }
+    return [
+      { x: cx, y: cy - d, angle: Math.PI }, // faces BLUE end (top)
+      { x: cx, y: cy + d, angle: 0 }, // faces RED end (bottom)
+    ]
+  }
+
+  function drawScoreboard() {
+    const c = ctx!
+    const fs = geo.rBase * 0.055
+    const gap = fs * 0.55
+    for (const p of scoreboardPlacements()) {
+      c.save()
+      c.translate(p.x, p.y)
+      c.rotate(p.angle)
+      c.textBaseline = 'middle'
+      c.font = `700 ${fs}px 'Orbitron', sans-serif`
+      const r = String(scores[0])
+      const b = String(scores[1])
+      const sep = '–'
+      const rw = c.measureText(r).width
+      const sw = c.measureText(sep).width
+      const bw = c.measureText(b).width
+      const total = rw + bw + sw + gap * 2
+      let x = -total / 2
+      c.textAlign = 'left'
+      c.fillStyle = RED
+      c.fillText(r, x, 0)
+      x += rw + gap
+      c.fillStyle = 'rgba(0,0,0,0.45)'
+      c.fillText(sep, x, 0)
+      x += sw + gap
+      c.fillStyle = BLUE
+      c.fillText(b, x, 0)
+      c.restore()
+    }
+  }
+
+  function drawCountdown() {
+    const c = ctx!
+    const n = Math.max(1, Math.ceil(phaseTimer / 500))
+    for (const p of countdownPlacements()) {
+      c.save()
+      c.translate(p.x, p.y)
+      c.rotate(p.angle)
+      c.textAlign = 'center'
+      c.textBaseline = 'middle'
+      c.font = `700 ${geo.rBase * 0.16}px 'Orbitron', sans-serif`
+      c.fillStyle = 'rgba(20,30,45,0.9)'
+      c.fillText(String(n), 0, 0)
+      c.restore()
+    }
+  }
+
+  function drawWinner() {
+    const c = ctx!
+    // dim the ice
+    c.save()
+    roundRectPath(c, geo.left, geo.top, geo.pw, geo.ph, geo.cornerR)
+    c.clip()
+    c.fillStyle = 'rgba(255,255,255,0.7)'
+    c.fillRect(0, 0, geo.W, geo.H)
+    c.restore()
+
+    const color = winner === 0 ? RED : BLUE
+    const team = winner === 0 ? 'RED' : 'BLUE'
+    for (const p of countdownPlacements()) {
+      c.save()
+      c.translate(p.x, p.y)
+      c.rotate(p.angle)
+      c.textAlign = 'center'
+      c.textBaseline = 'middle'
+      c.fillStyle = color
+      c.font = `700 ${geo.rBase * 0.08}px 'Orbitron', sans-serif`
+      c.fillText(`${team} WINS`, 0, -geo.rBase * 0.03)
+      c.fillStyle = 'rgba(20,30,45,0.85)'
+      c.font = `600 ${geo.rBase * 0.03}px 'Inter', sans-serif`
+      c.fillText('Tap to play again', 0, geo.rBase * 0.05)
+      c.restore()
+    }
+  }
+
+  // ── input ────────────────────────────────────────────────────────────────────
+  function toLocal(e: PointerEvent): Matter.Vector {
+    const rect = canvas.getBoundingClientRect()
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top }
+  }
+
+  function onDown(e: PointerEvent) {
+    e.preventDefault()
+    if (phase === 'gameover') {
+      reset()
+      return
+    }
+    const pt = toLocal(e)
+    const i = halfAt(pt.x, pt.y)
+    if ([...pointerOwner.values()].includes(i)) return // one finger per paddle
+    pointerOwner.set(e.pointerId, i)
+    targets[i] = clampToHalf(i, pt.x, pt.y)
+    try {
+      canvas.setPointerCapture(e.pointerId)
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function onMove(e: PointerEvent) {
+    const i = pointerOwner.get(e.pointerId)
+    if (i === undefined) return
+    const pt = toLocal(e)
+    targets[i] = clampToHalf(i, pt.x, pt.y)
+  }
+
+  function onUp(e: PointerEvent) {
+    const i = pointerOwner.get(e.pointerId)
+    if (i === undefined) return
+    pointerOwner.delete(e.pointerId)
+    targets[i] = null
+    try {
+      canvas.releasePointerCapture(e.pointerId)
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // ── main loop ─────────────────────────────────────────────────────────────────
+  let raf = 0
+  let last = performance.now()
+  let acc = 0
+  function frame(now: number) {
+    raf = requestAnimationFrame(frame)
+    let dt = now - last
+    last = now
+    if (dt > 100) dt = 100 // clamp after tab/visibility stalls
+    acc += dt
+    let steps = 0
+    while (acc >= PHYS_DT && steps < 5) {
+      step()
+      acc -= PHYS_DT
+      steps++
+    }
+    if (steps === 5) acc = 0
+    draw()
+  }
+
+  // ── bootstrap ─────────────────────────────────────────────────────────────────
+  buildWorld()
+  reset()
+  canvas.addEventListener('pointerdown', onDown)
+  canvas.addEventListener('pointermove', onMove)
+  canvas.addEventListener('pointerup', onUp)
+  canvas.addEventListener('pointercancel', onUp)
+  raf = requestAnimationFrame(frame)
+
+  return {
+    resize() {
+      const wasGameover = phase === 'gameover'
+      geo = computeGeo()
+      buildWorld()
+      if (wasGameover) {
+        phase = 'gameover'
+        Body.setPosition(puck, { x: geo.cx, y: geo.cy })
+        Body.setVelocity(puck, { x: 0, y: 0 })
+      } else {
+        resetPuck(serveToward)
+      }
+    },
+    reset,
+    destroy() {
+      cancelAnimationFrame(raf)
+      canvas.removeEventListener('pointerdown', onDown)
+      canvas.removeEventListener('pointermove', onMove)
+      canvas.removeEventListener('pointerup', onUp)
+      canvas.removeEventListener('pointercancel', onUp)
+      Composite.clear(engine.world, false, true)
+      Engine.clear(engine)
+    },
+    getState() {
+      return { scores: [scores[0], scores[1]], phase, winner, portrait: geo.portrait }
+    },
+    debugSetScore(p1: number, p2: number) {
+      scores[0] = p1
+      scores[1] = p2
+      if (p1 >= WIN_SCORE) {
+        winner = 0
+        phase = 'gameover'
+      } else if (p2 >= WIN_SCORE) {
+        winner = 1
+        phase = 'gameover'
+      }
+    },
+  }
+}

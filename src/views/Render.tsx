@@ -1,61 +1,60 @@
 /**
- * Render view — the display content shown on physical signage devices.
+ * Render view — full-screen two-player Air Hockey game.
  *
- * Before planning OR editing this view, invoke `skill(name: "design")` — it is
- * the source of truth for UI scaling, rem usage, title-safe zone, portrait /
- * landscape patterns, and the signage / kiosk / web references. Do not rely
- * on this file's comments alone.
+ * The whole experience lives on a single <canvas> driven by `createAirHockey`
+ * (matter-js physics + multi-touch input + canvas rendering). This view just
+ * mounts the canvas, loads the center TOS logo, wires a ResizeObserver, and
+ * tears the controller down on unmount.
  *
- * This is a pared-down template — no theme system, no entrance animations,
- * no prebuilt layout building blocks. Content is hardcoded here; edit the
- * JSX directly to change what the render shows.
- *
- * Adaptive knob wired below: `density` (full / comfortable / compact /
- * minimal). Use it to shed elements or reflow as space shrinks.
+ * Interactive kiosk view (see skill: design/kiosk) — touch input, no UI-scale
+ * slider. We intentionally use a pixel-space canvas sized to the viewport rather
+ * than rem/DOM layout, since this is a real-time game.
  */
 
-import { useUiAspectRatio } from '@telemetryos/sdk/react'
+import { useEffect, useRef } from 'react'
+import { createAirHockey, type AirHockeyController } from '../game/airHockey'
 import './Render.css'
 
-type Density = 'full' | 'comfortable' | 'compact' | 'minimal'
-
-function getDensity(aspectRatio: number): Density {
-  const isPortrait = aspectRatio < 1
-  const pressure = isPortrait ? 1.2 : 1
-  if (pressure < 1.4) return 'full'
-  if (pressure < 1.8) return 'comfortable'
-  if (pressure < 2.3) return 'compact'
-  return 'minimal'
-}
-
 export function Render() {
-  const aspectRatio = useUiAspectRatio()
-  const density = getDensity(aspectRatio)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const wrapRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    const wrap = wrapRef.current
+    if (!canvas || !wrap) return
+
+    let controller: AirHockeyController | undefined
+    let observer: ResizeObserver | undefined
+
+    const logo = new Image()
+    logo.src = '/assets/tos-mark.svg'
+
+    const start = () => {
+      controller = createAirHockey(canvas, logo)
+      observer = new ResizeObserver(() => controller?.resize())
+      observer.observe(wrap)
+      // Dev-only hook so MCP dom_eval can drive/verify match flow without touch.
+      ;(window as unknown as { __airHockey?: AirHockeyController }).__airHockey = controller
+    }
+
+    // Wait for the logo so the first frame includes it (errors still start the game).
+    if (logo.complete) start()
+    else {
+      logo.onload = start
+      logo.onerror = start
+    }
+
+    return () => {
+      observer?.disconnect()
+      controller?.destroy()
+      delete (window as unknown as { __airHockey?: AirHockeyController }).__airHockey
+    }
+  }, [])
 
   return (
-    <div className={`render render--${density}`}>
-      {/* ── Welcome content (replace with your app) ─────────────────────── */}
-
-      <img src="/assets/telemetryos-wordmark.svg" alt="TelemetryOS" className="render__logo" />
-
-      <div className="render__hero">
-        {density !== 'minimal' && (
-          <div className="render__hero-title">Welcome to TelemetryOS SDK</div>
-        )}
-      </div>
-
-      <div className="render__docs-information">
-        {density === 'full' && (
-          <>
-            <div className="render__docs-information-title">
-              To get started, edit the Render.tsx file
-            </div>
-            <div className="render__docs-information-text">
-              Visit our documentation on building applications to learn more
-            </div>
-          </>
-        )}
-      </div>
+    <div className="render render--game" ref={wrapRef}>
+      <canvas ref={canvasRef} className="air-hockey-canvas" />
     </div>
   )
 }
