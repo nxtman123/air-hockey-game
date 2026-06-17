@@ -13,6 +13,7 @@
 
 import { useEffect, useRef } from 'react'
 import { createAirHockey, type AirHockeyController } from '../game/airHockey'
+import { createBroadcaster } from '../game/broadcast'
 import './Render.css'
 
 export function Render() {
@@ -30,8 +31,11 @@ export function Render() {
     const logo = new Image()
     logo.src = '/assets/tos-mark.svg'
 
+    // Created once per mount (not per render) so store() is called a single time.
+    const broadcast = createBroadcaster()
+
     const start = () => {
-      controller = createAirHockey(canvas, logo)
+      controller = createAirHockey(canvas, logo, broadcast)
       observer = new ResizeObserver(() => controller?.resize())
       observer.observe(wrap)
       // Dev-only hook so MCP dom_eval can drive/verify match flow without touch.

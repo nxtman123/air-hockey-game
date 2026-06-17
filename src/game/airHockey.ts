@@ -66,12 +66,22 @@ interface Placement {
   angle: number
 }
 
+/** Announced to other apps (via the shared store) when a goal or win happens. */
+export type GameEvent = {
+  type: 'goal' | 'win'
+  team: 'red' | 'blue' // scorer (goal) / winner (win)
+  red: number
+  blue: number
+}
+
 export interface AirHockeyController {
   resize(): void
   reset(): void
   destroy(): void
   getState(): { scores: [number, number]; phase: Phase; winner: number; portrait: boolean }
   debugSetScore(p1: number, p2: number): void
+  /** Dev/test helper: drive a real goal through the scoring path (so it broadcasts). */
+  debugGoal(team: 0 | 1): void
 }
 
 const clamp = (v: number, min: number, max: number) => (v < min ? min : v > max ? max : v)
@@ -90,6 +100,7 @@ function roundRectPath(c: CanvasRenderingContext2D, x: number, y: number, w: num
 export function createAirHockey(
   canvas: HTMLCanvasElement,
   logo: HTMLImageElement,
+  onEvent?: (e: GameEvent) => void,
 ): AirHockeyController {
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('2D canvas context unavailable')
@@ -253,11 +264,14 @@ export function createAirHockey(
 
   function onGoal(scorer: number) {
     scores[scorer]++
+    const team: 'red' | 'blue' = scorer === 0 ? 'red' : 'blue'
+    onEvent?.({ type: 'goal', team, red: scores[0], blue: scores[1] })
     if (scores[scorer] >= WIN_SCORE) {
       winner = scorer
       phase = 'gameover'
       Body.setPosition(puck, { x: geo.cx, y: geo.cy })
       Body.setVelocity(puck, { x: 0, y: 0 })
+      onEvent?.({ type: 'win', team, red: scores[0], blue: scores[1] })
     } else {
       resetPuck((1 - scorer) as 0 | 1) // face off toward the player who conceded
     }
@@ -745,6 +759,9 @@ export function createAirHockey(
         winner = 1
         phase = 'gameover'
       }
+    },
+    debugGoal(team: 0 | 1) {
+      onGoal(team)
     },
   }
 }
