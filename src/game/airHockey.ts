@@ -25,6 +25,7 @@ const { Engine, Bodies, Body, Composite } = Matter
 const WIN_SCORE = 3
 const PHYS_DT = 1000 / 60 // fixed physics step (ms)
 const COUNTDOWN_MS = 1500 // pre-play countdown (3 → 2 → 1)
+const GOAL_CELEBRATION_MS = 5000 // "<TEAM> SCORES!" message + animation hold after a goal
 const STUCK_MS = 2000 // re-face-off if the puck idles in the unreachable neutral band
 
 // Team / rink palette
@@ -78,13 +79,24 @@ export interface AirHockeyController {
   resize(): void
   reset(): void
   destroy(): void
-  getState(): { scores: [number, number]; phase: Phase; winner: number; portrait: boolean }
+  getState(): {
+    scores: [number, number]
+    phase: Phase
+    winner: number
+    portrait: boolean
+    phaseTimer: number
+    celebrating: 0 | 1 | null
+  }
   debugSetScore(p1: number, p2: number): void
   /** Dev/test helper: drive a real goal through the scoring path (so it broadcasts). */
   debugGoal(team: 0 | 1): void
 }
 
 const clamp = (v: number, min: number, max: number) => (v < min ? min : v > max ? max : v)
+const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3)
+// fast decelerate / accelerate (no overshoot) — snappy "zoom" motion for the messages
+const easeOutExpo = (t: number) => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t))
+const easeInExpo = (t: number) => (t <= 0 ? 0 : Math.pow(2, 10 * (t - 1)))
 
 function roundRectPath(c: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
   const rr = Math.min(r, w / 2, h / 2)
@@ -116,9 +128,16 @@ export function createAirHockey(
   const scores: [number, number] = [0, 0]
   let phase: Phase = 'countdown'
   let phaseTimer = COUNTDOWN_MS
+  let phaseDuration = COUNTDOWN_MS // full length of the current countdown (for anim progress)
   let serveToward: 0 | 1 = 0 // half the puck is faced-off into (the receiver)
   let winner = -1
   let slowTimer = 0
+
+  // animation clocks (wall-clock ms, refreshed each frame)
+  let nowMs = performance.now()
+  let scoreFlash: { team: 0 | 1; startMs: number } | null = null // "<TEAM> SCORES!" celebration
+  let winStartMs = 0 // when the win banner began (entrance anim)
+  const scorePulseAt: [number, number] = [-1e9, -1e9] // per-team scoreboard pop timestamps
 
   // paddle finger targets (null = released); one pointer owns one paddle
   const targets: (Matter.Vector | null)[] = [null, null]
@@ -251,29 +270,35 @@ export function createAirHockey(
 
   // ── match flow ──────────────────────────────────────────────────────────────
   // Face-off: drop the puck STILL into a half. It only moves once struck.
-  function resetPuck(toward: 0 | 1) {
+  function resetPuck(toward: 0 | 1, duration = COUNTDOWN_MS) {
+    scoreFlash = null
     const fo = faceoffPoint(toward)
     Body.setPosition(puck, fo)
     Body.setVelocity(puck, { x: 0, y: 0 })
     Body.setAngularVelocity(puck, 0)
     serveToward = toward
     phase = 'countdown'
-    phaseTimer = COUNTDOWN_MS
+    phaseTimer = duration
+    phaseDuration = duration
     slowTimer = 0
   }
 
   function onGoal(scorer: number) {
     scores[scorer]++
+    scorePulseAt[scorer] = nowMs // pop the scoreboard digit
     const team: 'red' | 'blue' = scorer === 0 ? 'red' : 'blue'
     onEvent?.({ type: 'goal', team, red: scores[0], blue: scores[1] })
     if (scores[scorer] >= WIN_SCORE) {
       winner = scorer
+      winStartMs = nowMs
       phase = 'gameover'
       Body.setPosition(puck, { x: geo.cx, y: geo.cy })
       Body.setVelocity(puck, { x: 0, y: 0 })
       onEvent?.({ type: 'win', team, red: scores[0], blue: scores[1] })
     } else {
-      resetPuck((1 - scorer) as 0 | 1) // face off toward the player who conceded
+      // hold the "<TEAM> SCORES!" celebration for 5s before play resumes
+      resetPuck((1 - scorer) as 0 | 1, GOAL_CELEBRATION_MS)
+      scoreFlash = { team: scorer as 0 | 1, startMs: nowMs }
     }
   }
 
@@ -333,7 +358,10 @@ export function createAirHockey(
   function step() {
     if (phase === 'countdown') {
       phaseTimer -= PHYS_DT
-      if (phaseTimer <= 0) phase = 'playing' // puck stays put; players must strike it
+      if (phaseTimer <= 0) {
+        phase = 'playing' // puck stays put; players must strike it
+        scoreFlash = null
+      }
     }
 
     // velocity-chase paddles toward fingers
@@ -576,49 +604,140 @@ export function createAirHockey(
     ]
   }
 
+  // brief scale "pop" for a scoreboard digit right after its team scores
+  function teamPulse(i: number): number {
+    const t = (nowMs - scorePulseAt[i]) / 450
+    if (t < 0 || t > 1) return 1
+    return 1 + 0.7 * (1 - easeOutCubic(t))
+  }
+
   function drawScoreboard() {
     const c = ctx!
     const fs = geo.rBase * 0.055
     const gap = fs * 0.55
+    const r = String(scores[0])
+    const b = String(scores[1])
+    const sep = '–'
     for (const p of scoreboardPlacements()) {
       c.save()
       c.translate(p.x, p.y)
       c.rotate(p.angle)
       c.textBaseline = 'middle'
+      c.textAlign = 'center'
       c.font = `700 ${fs}px 'Orbitron', sans-serif`
-      const r = String(scores[0])
-      const b = String(scores[1])
-      const sep = '–'
       const rw = c.measureText(r).width
       const sw = c.measureText(sep).width
       const bw = c.measureText(b).width
       const total = rw + bw + sw + gap * 2
-      let x = -total / 2
-      c.textAlign = 'left'
+      const start = -total / 2
+      const rCenter = start + rw / 2
+      const sepCenter = start + rw + gap + sw / 2
+      const bCenter = start + rw + gap + sw + gap + bw / 2
+      // red digit (pops when red scores)
+      c.save()
+      c.translate(rCenter, 0)
+      c.scale(teamPulse(0), teamPulse(0))
       c.fillStyle = RED
-      c.fillText(r, x, 0)
-      x += rw + gap
+      c.fillText(r, 0, 0)
+      c.restore()
+      // separator
       c.fillStyle = 'rgba(0,0,0,0.45)'
-      c.fillText(sep, x, 0)
-      x += sw + gap
+      c.fillText(sep, sepCenter, 0)
+      // blue digit (pops when blue scores)
+      c.save()
+      c.translate(bCenter, 0)
+      c.scale(teamPulse(1), teamPulse(1))
       c.fillStyle = BLUE
-      c.fillText(b, x, 0)
+      c.fillText(b, 0, 0)
+      c.restore()
       c.restore()
     }
   }
 
   function drawCountdown() {
+    // After a goal the countdown window hosts the "<TEAM> SCORES!" celebration instead.
+    if (scoreFlash) {
+      drawScoreFlash()
+      return
+    }
     const c = ctx!
     const n = Math.max(1, Math.ceil(phaseTimer / 500))
+    // progress within the current 1s digit (0 = just appeared → 1 = about to switch)
+    let rem = phaseTimer % 500
+    if (rem === 0) rem = 500
+    const p01 = (500 - rem) / 500
+    // fast zoom-in (no overshoot) with a brief horizontal motion-stretch, then hold/fade
+    const e = easeOutExpo(clamp(p01 / 0.22, 0, 1))
+    const zoom = 1 + 0.9 * (1 - e) // 1.9 → 1.0, snappy
+    const stretchX = zoom * (1 + 0.7 * (1 - e))
+    let alpha = Math.min(1, p01 * 6)
+    if (p01 > 0.78) alpha *= 1 - (p01 - 0.78) / 0.22 // fade as the digit expires
     for (const p of countdownPlacements()) {
       c.save()
       c.translate(p.x, p.y)
       c.rotate(p.angle)
+      c.scale(stretchX, zoom)
       c.textAlign = 'center'
       c.textBaseline = 'middle'
       c.font = `700 ${geo.rBase * 0.16}px 'Orbitron', sans-serif`
-      c.fillStyle = 'rgba(20,30,45,0.9)'
+      c.fillStyle = `rgba(20,30,45,${alpha})`
       c.fillText(String(n), 0, 0)
+      c.restore()
+    }
+  }
+
+  // Draws text at the local origin with a horizontal "speed streak": the glyph slides
+  // along its reading axis (slideX), stretches while moving fast (stretchX), and trails
+  // faint motion-blur echoes behind it. Caller sets font + textAlign/baseline and the
+  // translate/rotate placement. `speed` is the current motion magnitude (0 = parked).
+  function drawStreakText(text: string, color: string, alpha: number, slideX: number, stretchX: number, speed: number) {
+    const c = ctx!
+    if (alpha <= 0.01) return
+    if (speed > 0.04) {
+      for (let g = 3; g >= 1; g--) {
+        c.save()
+        c.globalAlpha = alpha * 0.12 * (1 - (g - 1) / 3)
+        c.translate(slideX + speed * geo.rBase * 0.25 * g, 0)
+        c.scale(stretchX, 1)
+        c.fillStyle = color
+        c.fillText(text, 0, 0)
+        c.restore()
+      }
+    }
+    c.save()
+    c.globalAlpha = alpha
+    c.translate(slideX, 0)
+    c.scale(stretchX, 1)
+    c.shadowColor = color
+    c.shadowBlur = geo.rBase * 0.03
+    c.fillStyle = color
+    c.fillText(text, 0, 0)
+    c.restore()
+  }
+
+  // Celebratory "<TEAM> SCORES!" — zooms in fast from the side, holds, then streaks out.
+  function drawScoreFlash() {
+    if (!scoreFlash) return
+    const c = ctx!
+    const color = scoreFlash.team === 0 ? RED : BLUE
+    const label = `${scoreFlash.team === 0 ? 'RED' : 'BLUE'} SCORES!`
+    const p = clamp((phaseDuration - phaseTimer) / phaseDuration, 0, 1)
+    const inP = clamp(p / 0.1, 0, 1)
+    const outP = clamp((p - 0.88) / 0.12, 0, 1)
+    const eIn = easeOutExpo(inP)
+    const eOut = easeInExpo(outP)
+    const slideX = (1 - eIn) * geo.rBase * 1.4 - eOut * geo.rBase * 1.9 // whoosh in → blast out
+    const speed = 1 - eIn + eOut
+    const stretchX = 1 + speed * 1.3 // motion-blur stretch along travel
+    const alpha = Math.min(1, inP * 2) * (1 - outP)
+    for (const pl of countdownPlacements()) {
+      c.save()
+      c.translate(pl.x, pl.y)
+      c.rotate(pl.angle)
+      c.textAlign = 'center'
+      c.textBaseline = 'middle'
+      c.font = `700 ${geo.rBase * 0.1}px 'Orbitron', sans-serif`
+      drawStreakText(label, color, alpha, slideX, stretchX, speed)
       c.restore()
     }
   }
@@ -634,17 +753,27 @@ export function createAirHockey(
     c.restore()
 
     const color = winner === 0 ? RED : BLUE
-    const team = winner === 0 ? 'RED' : 'BLUE'
+    const team = `${winner === 0 ? 'RED' : 'BLUE'} WINS`
+    const inT = clamp((nowMs - winStartMs) / 450, 0, 1)
+    const e = easeOutExpo(inT) // fast zoom-in, then dead steady (no breathing)
+    const slideX = (1 - e) * geo.rBase * 1.9 // streaks in from the side
+    const speed = 1 - e
+    const stretchX = 1 + speed * 1.6
+    const tapAlpha = 0.35 + 0.35 * (0.5 + 0.5 * Math.sin(nowMs / 600)) // slow steady fade
     for (const p of countdownPlacements()) {
       c.save()
       c.translate(p.x, p.y)
       c.rotate(p.angle)
       c.textAlign = 'center'
       c.textBaseline = 'middle'
-      c.fillStyle = color
+      // headline streaks in along its reading axis
+      c.save()
+      c.translate(0, -geo.rBase * 0.03)
       c.font = `700 ${geo.rBase * 0.08}px 'Orbitron', sans-serif`
-      c.fillText(`${team} WINS`, 0, -geo.rBase * 0.03)
-      c.fillStyle = 'rgba(20,30,45,0.85)'
+      drawStreakText(team, color, e, slideX, stretchX, speed)
+      c.restore()
+      // steady prompt (fades in once the headline has arrived)
+      c.fillStyle = `rgba(20,30,45,${tapAlpha * e})`
       c.font = `600 ${geo.rBase * 0.03}px 'Inter', sans-serif`
       c.fillText('Tap to play again', 0, geo.rBase * 0.05)
       c.restore()
@@ -700,6 +829,7 @@ export function createAirHockey(
   let acc = 0
   function frame(now: number) {
     raf = requestAnimationFrame(frame)
+    nowMs = now
     let dt = now - last
     last = now
     if (dt > 100) dt = 100 // clamp after tab/visibility stalls
@@ -725,15 +855,14 @@ export function createAirHockey(
 
   return {
     resize() {
-      const wasGameover = phase === 'gameover'
+      // Rebuild geometry/bodies for the new size WITHOUT disturbing match state
+      // (phase, countdown timer, score celebration, winner all preserved). buildWorld
+      // re-seats the puck at the current face-off spot; gameover parks it at center.
       geo = computeGeo()
       buildWorld()
-      if (wasGameover) {
-        phase = 'gameover'
+      if (phase === 'gameover') {
         Body.setPosition(puck, { x: geo.cx, y: geo.cy })
         Body.setVelocity(puck, { x: 0, y: 0 })
-      } else {
-        resetPuck(serveToward)
       }
     },
     reset,
@@ -747,7 +876,14 @@ export function createAirHockey(
       Engine.clear(engine)
     },
     getState() {
-      return { scores: [scores[0], scores[1]], phase, winner, portrait: geo.portrait }
+      return {
+        scores: [scores[0], scores[1]],
+        phase,
+        winner,
+        portrait: geo.portrait,
+        phaseTimer: Math.round(phaseTimer),
+        celebrating: scoreFlash ? scoreFlash.team : null,
+      }
     },
     debugSetScore(p1: number, p2: number) {
       scores[0] = p1
@@ -755,9 +891,11 @@ export function createAirHockey(
       if (p1 >= WIN_SCORE) {
         winner = 0
         phase = 'gameover'
+        winStartMs = nowMs
       } else if (p2 >= WIN_SCORE) {
         winner = 1
         phase = 'gameover'
+        winStartMs = nowMs
       }
     },
     debugGoal(team: 0 | 1) {
