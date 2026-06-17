@@ -1,0 +1,9 @@
+minimumReleaseAge: 10080
+
+minimumReleaseAgeExclude:
+  - '@telemetryos/*'
+
+blockExoticSubdeps: true
+
+allowBuilds:
+  esbuild: false
