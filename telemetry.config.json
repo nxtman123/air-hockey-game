@@ -1,7 +1,7 @@
 {
   "name": "Air Hockey",
   "description": "A silly game for the trade show",
-  "logoPath": "public/assets/tos-app.svg",
+  "logoPath": "public/assets/icon.png",
   "thumbnailPath": "public/assets/thumbnail.png",
   "version": "2026.6.0",
   "mountPoints": {
