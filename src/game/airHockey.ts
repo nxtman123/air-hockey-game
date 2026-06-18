@@ -19,7 +19,7 @@
 
 import Matter from 'matter-js'
 
-const { Engine, Bodies, Body, Composite, Events } = Matter
+const { Engine, Bodies, Body, Composite } = Matter
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 const WIN_SCORE = 3
@@ -32,6 +32,7 @@ const POWERUP_DELAY_MS = 5000 // goal-less live play before a power-up appears a
 const POWERUP_LIFETIME_MS = 8000 // a power-up fades if no paddle grabs it in time
 const MAX_EXTRA_PUCKS = 2 // safety cap so the repeating "two pucks" power-up can't run away
 const INVINCIBLE_SPEED_MULT = 1.7 // an invincible puck moves this much faster than the normal cap
+const INVINCIBLE_MS = 2000 // how long an invincible-puck run lasts before reverting to normal
 
 // Team / rink palette
 const RED = '#e23b3b' // Player 1
@@ -132,21 +133,6 @@ export function createAirHockey(
   engine.gravity.x = 0
   engine.gravity.y = 0
 
-  // An invincible puck's run ends the instant it strikes a wall (it phases through the opponent
-  // paddle, which emits no collisions, so a wall bounce is the only event we can hit here).
-  Events.on(engine, 'collisionStart', (e) => {
-    if (!invincible) return
-    for (const { bodyA, bodyB } of e.pairs) {
-      if (
-        (bodyA === invincible.puck && bodyB.label === 'wall') ||
-        (bodyB === invincible.puck && bodyA.label === 'wall')
-      ) {
-        endInvincible()
-        return
-      }
-    }
-  })
-
   let iceTexture: HTMLCanvasElement | null = null // cached scratchy-ice scuffs (rebuilt on resize)
   // Nothing in the rink moves, so the whole static composite (bg + ice + markings + creases +
   // scuffs + logo) is baked once per size and blitted each frame. The puck/paddle are pre-rendered
@@ -176,7 +162,7 @@ export function createAirHockey(
   // invincibility stage 1: an owner paddle is charged & glowing, waiting to strike the puck
   let charge: { owner: 0 | 1; sinceMs: number } | null = null
   // invincibility stage 2: a puck is mid-invincible-run (fast, glowing, phases through opponent)
-  let invincible: { puck: Matter.Body; owner: 0 | 1 } | null = null
+  let invincible: { puck: Matter.Body; owner: 0 | 1; sinceMs: number } | null = null
 
   // animation clocks (wall-clock ms, refreshed each frame)
   let nowMs = performance.now()
@@ -552,7 +538,6 @@ export function createAirHockey(
       addWall(xL, bottom + half, segL, t)
       addWall(xR, bottom + half, segR, t)
     }
-    for (const w of walls) w.label = 'wall' // so collisionStart can spot an invincible-puck bounce
     Composite.add(engine.world, walls)
 
     const fo = faceoffSpot()
@@ -627,8 +612,9 @@ export function createAirHockey(
   // Stage 2: the charged owner has just struck `b`. Make it phase through the opponent paddle
   // (a shared negative collisionFilter.group disables that one pair while leaving walls + the
   // owner's paddle solid) and shove it off at the invincible speed in its post-hit direction.
+  // The run lasts INVINCIBLE_MS (it bounces off walls during that window) then reverts to normal.
   function launchInvincible(b: Matter.Body, owner: 0 | 1) {
-    invincible = { puck: b, owner }
+    invincible = { puck: b, owner, sinceMs: nowMs }
     b.collisionFilter.group = -1
     paddles[1 - owner].collisionFilter.group = -1
     const fast = geo.rBase * 0.03 * INVINCIBLE_SPEED_MULT
@@ -879,6 +865,10 @@ export function createAirHockey(
       }
     }
 
+    // the invincible-puck run is purely time-boxed: after INVINCIBLE_MS, restore normal
+    // collision + speed (it keeps whatever heading/speed it has, re-clamped to the normal cap)
+    if (invincible && nowMs - invincible.sinceMs > INVINCIBLE_MS) endInvincible()
+
     // cap every puck's speed to prevent tunneling through rails / goal posts (the invincible puck
     // gets a higher cap so its launch boost isn't immediately clamped away)
     const maxp = geo.rBase * 0.03
@@ -898,8 +888,8 @@ export function createAirHockey(
   }
 
   // Drive the power-up: spawn it after enough goal-less play, grant its effect when a paddle
-  // touches it, or let it time out. The goal-less clock only ticks while no power-up is pending,
-  // no invincibility effect is in progress, and the extra-puck cap leaves room.
+  // touches it, or let it time out. The goal-less clock only ticks while no power-up is pending
+  // and no invincibility effect is in progress.
   function updatePowerUp() {
     if (powerUp) {
       if (nowMs - powerUp.spawnMs > POWERUP_LIFETIME_MS) {
@@ -916,7 +906,9 @@ export function createAirHockey(
           return
         }
       }
-    } else if (puckMovedSinceFaceoff && !charge && !invincible && extraPucks.length < MAX_EXTRA_PUCKS) {
+    } else if (puckMovedSinceFaceoff && !charge && !invincible) {
+      // A power-up always appears during goal-less play. The puck cap only constrains the
+      // "two pucks" kind — spawnPowerUp() falls back to invincibility when extras are maxed.
       goallessMs += PHYS_DT
       if (goallessMs >= POWERUP_DELAY_MS) spawnPowerUp()
     }
