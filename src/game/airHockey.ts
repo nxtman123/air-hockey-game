@@ -27,6 +27,7 @@ const PHYS_DT = 1000 / 60 // fixed physics step (ms)
 const COUNTDOWN_MS = 1500 // pre-play countdown (3 → 2 → 1)
 const GOAL_CELEBRATION_MS = 2000 // "<TEAM> SCORES!" / win celebration hold (scrim + input lock)
 const STUCK_MS = 2000 // re-face-off if the puck idles in the unreachable neutral band
+const HOLD_RESET_MS = 2000 // hold a hidden dark-corner hot zone this long to reset to READY
 
 // Team / rink palette
 const RED = '#e23b3b' // Player 1
@@ -38,8 +39,9 @@ const OUTSIDE = '#000000'
 const RED_LINE_WASH = '#e39aa1'
 const BLUE_LINE_WASH = '#9fb0e8'
 const PUCK_COLOR = '#101418'
+const TOS_YELLOW = '#F7B435' // TelemetryOS brand yellow — the READY headline
 
-type Phase = 'celebrating' | 'countdown' | 'playing' | 'gameover'
+type Phase = 'celebrating' | 'countdown' | 'playing' | 'gameover' | 'ready'
 
 interface Geo {
   W: number
@@ -87,6 +89,7 @@ export interface AirHockeyController {
     portrait: boolean
     phaseTimer: number
     celebrating: 0 | 1 | null
+    holding: boolean
   }
   debugSetScore(p1: number, p2: number): void
   /** Dev/test helper: drive a real goal through the scoring path (so it broadcasts). */
@@ -148,11 +151,14 @@ export function createAirHockey(
   let nowMs = performance.now()
   let scoreFlash: { team: 0 | 1; startMs: number } | null = null // "<TEAM> SCORES!" celebration
   let winStartMs = 0 // when the win banner began (entrance anim)
+  let readyStartMs = 0 // when the READY lobby began (entrance anim)
   const scorePulseAt: [number, number] = [-1e9, -1e9] // per-team scoreboard pop timestamps
 
   // paddle finger targets (null = released); one pointer owns one paddle
   const targets: (Matter.Vector | null)[] = [null, null]
   const pointerOwner = new Map<number, number>()
+  // hidden hold-to-reset hot zones in the dark corners; one pointer per corner press
+  const cornerHolds = new Map<number, { corner: number; startMs: number }>()
 
   // ── geometry ────────────────────────────────────────────────────────────────
   function computeGeo(): Geo {
@@ -376,6 +382,31 @@ export function createAirHockey(
     return y > geo.cy ? 0 : 1
   }
 
+  // The four black corners (dark area outside the rounded ice arc). Each descriptor carries
+  // the ice arc's center (acx,acy) + sweep (a0→a1) — reused from buildWorld's addCorner — the
+  // screen corner vertex (scx,scy), and the quadrant sign (sx,sy) toward that screen corner.
+  function corners() {
+    const { left, right, top, bottom, cornerR } = geo
+    const r = cornerR
+    return [
+      { acx: left + r, acy: top + r, a0: Math.PI, a1: Math.PI * 1.5, scx: left, scy: top, sx: -1, sy: -1 },
+      { acx: right - r, acy: top + r, a0: Math.PI * 1.5, a1: Math.PI * 2, scx: right, scy: top, sx: 1, sy: -1 },
+      { acx: right - r, acy: bottom - r, a0: 0, a1: Math.PI * 0.5, scx: right, scy: bottom, sx: 1, sy: 1 },
+      { acx: left + r, acy: bottom - r, a0: Math.PI * 0.5, a1: Math.PI, scx: left, scy: bottom, sx: -1, sy: 1 },
+    ]
+  }
+
+  // index of the dark corner zone containing (x,y), or -1. A point qualifies when it sits in
+  // the corner's quadrant AND outside the ice arc (so only the black wedge counts, not the ice).
+  function cornerAt(x: number, y: number): number {
+    const cs = corners()
+    for (let k = 0; k < cs.length; k++) {
+      const { acx, acy, sx, sy } = cs[k]
+      if ((x - acx) * sx > 0 && (y - acy) * sy > 0 && Math.hypot(x - acx, y - acy) > geo.cornerR) return k
+    }
+    return -1
+  }
+
   // ── world construction ────────────────────────────────────────────────────
   function buildWorld() {
     Composite.clear(engine.world, false, true)
@@ -553,7 +584,9 @@ export function createAirHockey(
     }
   }
 
-  function reset() {
+  // Wipe the match back to 0–0 with paddles home and fingers released. Shared prelude for
+  // both the READY lobby (reset) and an immediate restart (newMatch).
+  function clearBoard() {
     scores[0] = 0
     scores[1] = 0
     winner = -1
@@ -563,11 +596,44 @@ export function createAirHockey(
     })
     targets[0] = null
     targets[1] = null
-    resetPuck(serveToward, COUNTDOWN_MS, true) // new game: puck dead center
+    scoreFlash = null
+  }
+
+  // Full reset to the READY lobby (first launch + secret hold-reset). Lands on a "READY /
+  // Tap to play" screen — a tap then runs startGame(). Distinct from the post-win restart,
+  // which counts down directly without passing through READY.
+  function reset() {
+    clearBoard()
+    centerFaceoff = true
+    Body.setPosition(puck, { x: geo.cx, y: geo.cy }) // puck dead center, waiting
+    Body.setVelocity(puck, { x: 0, y: 0 })
+    Body.setAngularVelocity(puck, 0)
+    phase = 'ready'
+    readyStartMs = nowMs
+  }
+
+  // Leave the READY lobby and begin a fresh centered countdown.
+  function startGame() {
+    resetPuck(serveToward, COUNTDOWN_MS, true)
+  }
+
+  // Immediate restart after a win: clear the board and count straight down (no READY screen).
+  function newMatch() {
+    clearBoard()
+    startGame()
   }
 
   // ── per-frame simulation ────────────────────────────────────────────────────
   function step() {
+    // a held dark-corner hot zone that reaches the threshold resets the whole game to READY
+    for (const h of cornerHolds.values()) {
+      if (nowMs - h.startMs >= HOLD_RESET_MS) {
+        cornerHolds.clear()
+        reset()
+        return
+      }
+    }
+
     if (phase === 'celebrating') {
       // "<TEAM> SCORES!" + scrim holds for the full window, then a fresh countdown runs
       phaseTimer -= PHYS_DT
@@ -585,7 +651,7 @@ export function createAirHockey(
     for (let i = 0; i < 2; i++) {
       const p = paddles[i]
       const tgt = targets[i]
-      if (tgt && phase !== 'gameover' && phase !== 'celebrating') {
+      if (tgt && (phase === 'playing' || phase === 'countdown')) {
         let vx = (tgt.x - p.position.x) * 0.85
         let vy = (tgt.y - p.position.y) * 0.85
         const maxv = geo.rBase * 0.1
@@ -650,6 +716,9 @@ export function createAirHockey(
       drawScrim()
       drawScoreFlash()
     } else if (phase === 'gameover') drawWinner()
+    else if (phase === 'ready') drawReady()
+
+    drawCornerHolds() // hidden hold-to-reset glow — on top of everything, including the scrim
   }
 
   function drawMarkings(c: CanvasRenderingContext2D) {
@@ -988,6 +1057,61 @@ export function createAirHockey(
     }
   }
 
+  // READY lobby — mirrors the winner banner (scrim + double-sided headline + tap prompt) but
+  // shows "READY" in TelemetryOS yellow. Reached on first launch and after a secret hold-reset.
+  function drawReady() {
+    const c = ctx!
+    drawScrim()
+
+    const inT = clamp((nowMs - readyStartMs) / 450, 0, 1)
+    const e = easeOutExpo(inT) // fast zoom-in, then dead steady
+    const slideX = (1 - e) * geo.rBase * 1.9 // streaks in from the side
+    const speed = 1 - e
+    const stretchX = 1 + speed * 1.6
+    // prompt fades in shortly after the headline lands (no celebration window to wait on)
+    const promptIn = clamp((nowMs - readyStartMs - 300) / 400, 0, 1)
+    const tapAlpha = (0.35 + 0.35 * (0.5 + 0.5 * Math.sin(nowMs / 600))) * promptIn
+    for (const p of countdownPlacements(0.34)) {
+      c.save()
+      c.translate(p.x, p.y)
+      c.rotate(p.angle)
+      c.textAlign = 'center'
+      c.textBaseline = 'middle'
+      c.save()
+      c.translate(0, -geo.rBase * 0.03)
+      c.font = `700 ${geo.rBase * 0.16}px 'Orbitron', sans-serif`
+      drawStreakText('READY', TOS_YELLOW, e, slideX, stretchX, speed)
+      c.restore()
+      c.fillStyle = `rgba(20,30,45,${tapAlpha})`
+      c.font = `600 ${geo.rBase * 0.03}px 'Inter', sans-serif`
+      c.fillText('Tap to play', 0, geo.rBase * 0.18)
+      c.restore()
+    }
+  }
+
+  // While a dark-corner hot zone is pressed, fill its black wedge with a pulsing white glow that
+  // brightens as it nears the HOLD_RESET_MS threshold ("appears and pulses white"). Invisible
+  // at rest (drawn only for active holds).
+  function drawCornerHolds() {
+    if (cornerHolds.size === 0) return
+    const c = ctx!
+    const cs = corners()
+    const pulse = 0.6 + 0.4 * Math.sin(nowMs / 140)
+    for (const h of cornerHolds.values()) {
+      const { acx, acy, a0, a1, scx, scy } = cs[h.corner]
+      const t = clamp((nowMs - h.startMs) / HOLD_RESET_MS, 0, 1)
+      const alpha = clamp((0.18 + 0.5 * t) * pulse, 0, 1)
+      c.save()
+      c.beginPath()
+      c.moveTo(scx, scy) // screen corner vertex
+      c.arc(acx, acy, geo.cornerR, a0, a1) // along the ice arc between the two edge tangent points
+      c.closePath()
+      c.fillStyle = `rgba(255,255,255,${alpha})`
+      c.fill()
+      c.restore()
+    }
+  }
+
   // ── input ────────────────────────────────────────────────────────────────────
   // All input is swallowed for the full 5s of a goal celebration and a game-over banner.
   function inputLocked(): boolean {
@@ -1002,12 +1126,28 @@ export function createAirHockey(
 
   function onDown(e: PointerEvent) {
     e.preventDefault()
-    if (inputLocked()) return
-    if (phase === 'gameover') {
-      reset()
+    const pt = toLocal(e)
+    // hidden secret reset: a press in any dark corner starts a hold (active in every phase,
+    // even while input is otherwise locked). It never grabs a paddle.
+    const corner = cornerAt(pt.x, pt.y)
+    if (corner >= 0) {
+      cornerHolds.set(e.pointerId, { corner, startMs: nowMs })
+      try {
+        canvas.setPointerCapture(e.pointerId)
+      } catch {
+        /* ignore */
+      }
       return
     }
-    const pt = toLocal(e)
+    if (inputLocked()) return
+    if (phase === 'gameover') {
+      newMatch() // "tap to play again" → straight into the countdown
+      return
+    }
+    if (phase === 'ready') {
+      startGame()
+      return
+    }
     const i = halfAt(pt.x, pt.y)
     if ([...pointerOwner.values()].includes(i)) return // one finger per paddle
     pointerOwner.set(e.pointerId, i)
@@ -1020,6 +1160,13 @@ export function createAirHockey(
   }
 
   function onMove(e: PointerEvent) {
+    const hold = cornerHolds.get(e.pointerId)
+    if (hold !== undefined) {
+      // sliding the finger out of the corner's dark zone cancels the hold (button semantics)
+      const pt = toLocal(e)
+      if (cornerAt(pt.x, pt.y) !== hold.corner) cornerHolds.delete(e.pointerId)
+      return
+    }
     const i = pointerOwner.get(e.pointerId)
     if (i === undefined) return
     const pt = toLocal(e)
@@ -1027,8 +1174,16 @@ export function createAirHockey(
   }
 
   function onUp(e: PointerEvent) {
+    cornerHolds.delete(e.pointerId)
     const i = pointerOwner.get(e.pointerId)
-    if (i === undefined) return
+    if (i === undefined) {
+      try {
+        canvas.releasePointerCapture(e.pointerId)
+      } catch {
+        /* ignore */
+      }
+      return
+    }
     pointerOwner.delete(e.pointerId)
     targets[i] = null
     try {
@@ -1052,7 +1207,9 @@ export function createAirHockey(
     // Idle on the game-over screen: once the winner banner has settled, nothing moves but the
     // slow prompt pulse, so drop to ~15fps to cut power/heat. A tap still resets instantly
     // (handled in onDown, independent of this loop). rAF is already re-scheduled above.
-    const idle = phase === 'gameover' && now - winStartMs > WIN_BANNER_SETTLE_MS
+    // A live corner-hold must animate its pulse + check the 2s timer every frame, so it
+    // overrides the game-over idle throttle.
+    const idle = phase === 'gameover' && now - winStartMs > WIN_BANNER_SETTLE_MS && cornerHolds.size === 0
     if (idle && now - lastWork < IDLE_FRAME_MS) return
     lastWork = now
     let dt = now - last
@@ -1110,6 +1267,7 @@ export function createAirHockey(
         portrait: geo.portrait,
         phaseTimer: Math.round(phaseTimer),
         celebrating: scoreFlash ? scoreFlash.team : null,
+        holding: cornerHolds.size > 0,
       }
     },
     debugSetScore(p1: number, p2: number) {
