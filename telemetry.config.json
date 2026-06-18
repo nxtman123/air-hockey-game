@@ -1,15 +1,15 @@
 {
   "name": "Air Hockey",
+  "version": "2026.6.1",
   "description": "A silly game for the trade show",
   "logoPath": "public/assets/icon.png",
   "thumbnailPath": "public/assets/thumbnail.png",
-  "version": "2026.6.0",
   "mountPoints": {
     "render": "/render"
   },
   "devServer": {
+    "runCommand": "pnpm install && vite --port $PORT",
     "url": "http://localhost:$PORT",
-    "readyPattern": "VITE.*ready in",
-    "runCommand": "pnpm install && vite --port $PORT"
+    "readyPattern": "VITE.*ready in"
   }
 }

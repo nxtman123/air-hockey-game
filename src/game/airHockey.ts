@@ -31,10 +31,13 @@ const STUCK_MS = 2000 // re-face-off if the puck idles in the unreachable neutra
 // Team / rink palette
 const RED = '#e23b3b' // Player 1
 const BLUE = '#2f6bff' // Player 2
-const ICE = '#ffffff'
+const ICE = '#d6e1f1' // icy blue
+const ICE_EDGE = '#cfdcef' // bluer near the rink edges (gradient)
+const ICE_MID = '#dde8f5' // lighter toward the middle
 const OUTSIDE = '#000000'
-const RED_LINE = '#d11f2a'
-const BLUE_LINE = '#1f47d1'
+// washed-out (pastel) marking colors — full-opacity so overlapping strokes don't darken
+const RED_LINE_WASH = '#e39aa1'
+const BLUE_LINE_WASH = '#9fb0e8'
 const PUCK_COLOR = '#101418'
 
 type Phase = 'celebrating' | 'countdown' | 'playing' | 'gameover'
@@ -120,6 +123,7 @@ export function createAirHockey(
   engine.gravity.x = 0
   engine.gravity.y = 0
 
+  let iceTexture: HTMLCanvasElement | null = null // cached scratchy-ice scuffs (rebuilt on resize)
   let geo: Geo = computeGeo()
   let puck: Matter.Body
   let paddles: Matter.Body[] = []
@@ -160,6 +164,7 @@ export function createAirHockey(
     const bottom = H - margin
     const pw = right - left
     const ph = bottom - top
+    iceTexture = buildIceTexture(pw, ph, rBase) // regenerate scuffs for the new dimensions
     return {
       W,
       H,
@@ -179,6 +184,32 @@ export function createAirHockey(
       wall: rBase * 0.045,
       goalLen: (portrait ? pw : ph) * 0.34,
     }
+  }
+
+  // Build a static "scratchy ice" texture once per size: many short, faint, randomly
+  // angled scuffs (low-alpha white + faint blue-gray). Cached and composited each frame so
+  // the scratches never flicker. Returns null if an offscreen context can't be created.
+  function buildIceTexture(w: number, h: number, rBase: number): HTMLCanvasElement | null {
+    const t = document.createElement('canvas')
+    t.width = Math.max(1, Math.round(w))
+    t.height = Math.max(1, Math.round(h))
+    const tc = t.getContext('2d')
+    if (!tc) return null
+    tc.lineCap = 'round'
+    const n = Math.round((w * h) / 175) // dense field of fine scuffs (scales with rink area)
+    for (let i = 0; i < n; i++) {
+      const x = Math.random() * w
+      const y = Math.random() * h
+      const ang = Math.random() * Math.PI * 2
+      const len = rBase * (0.005 + Math.random() * 0.6) // short scratches
+      tc.strokeStyle = 'rgba(96,124,168,0.05)'
+      tc.lineWidth = Math.random() < 0.9 ? 0.5 : 0.9
+      tc.beginPath()
+      tc.moveTo(x, y)
+      tc.lineTo(x + Math.cos(ang) * len, y + Math.sin(ang) * len)
+      tc.stroke()
+    }
+    return t
   }
 
   function homePos(i: number): Matter.Vector {
@@ -490,15 +521,23 @@ export function createAirHockey(
     c.fillStyle = OUTSIDE
     c.fillRect(0, 0, W, H)
 
-    // white ice with rounded corners
+    // faintly-blue ice with rounded corners — subtle gradient: bluer at the edges, lighter
+    // toward the middle, for a touch of depth
     roundRectPath(c, left, top, pw, ph, cornerR)
-    c.fillStyle = ICE
+    const iceGrad = geo.portrait
+      ? c.createLinearGradient(0, top, 0, top + ph)
+      : c.createLinearGradient(left, 0, left + pw, 0)
+    iceGrad.addColorStop(0, ICE_EDGE)
+    iceGrad.addColorStop(0.5, ICE_MID)
+    iceGrad.addColorStop(1, ICE_EDGE)
+    c.fillStyle = iceGrad
     c.fill()
 
-    // markings + goals + logo clipped to the ice
+    // texture + markings + goals + logo clipped to the ice
     c.save()
     roundRectPath(c, left, top, pw, ph, cornerR)
     c.clip()
+    if (iceTexture) c.drawImage(iceTexture, left, top, pw, ph) // scratchy scuffs (under the lines)
     drawMarkings()
     drawGoals()
     drawLogo()
@@ -522,9 +561,11 @@ export function createAirHockey(
     const lw = Math.max(2, rBase * 0.01)
     c.lineWidth = lw
 
+    // washed-out markings use pre-faded pastel colors (full opacity) so overlapping
+    // strokes — e.g. the center line crossing the face-off ring — don't darken
     if (!portrait) {
       // blue zone lines
-      c.strokeStyle = BLUE_LINE
+      c.strokeStyle = BLUE_LINE_WASH
       for (const x of [cx - pw * 0.17, cx + pw * 0.17]) {
         c.beginPath()
         c.moveTo(x, top)
@@ -532,7 +573,7 @@ export function createAirHockey(
         c.stroke()
       }
       // red goal lines
-      c.strokeStyle = RED_LINE
+      c.strokeStyle = RED_LINE_WASH
       c.lineWidth = lw * 0.7
       for (const x of [left + pw * 0.05, right - pw * 0.05]) {
         c.beginPath()
@@ -547,14 +588,14 @@ export function createAirHockey(
       c.lineTo(cx, bottom)
       c.stroke()
     } else {
-      c.strokeStyle = BLUE_LINE
+      c.strokeStyle = BLUE_LINE_WASH
       for (const y of [cy - ph * 0.17, cy + ph * 0.17]) {
         c.beginPath()
         c.moveTo(left, y)
         c.lineTo(right, y)
         c.stroke()
       }
-      c.strokeStyle = RED_LINE
+      c.strokeStyle = RED_LINE_WASH
       c.lineWidth = lw * 0.7
       for (const y of [top + ph * 0.05, bottom - ph * 0.05]) {
         c.beginPath()
@@ -569,13 +610,13 @@ export function createAirHockey(
       c.stroke()
     }
 
-    // clean white face-off spot so the logo reads clearly over the lines
+    // clean ice face-off spot so the logo reads clearly over the lines
     c.beginPath()
     c.arc(cx, cy, rBase * 0.16, 0, Math.PI * 2)
     c.fillStyle = ICE
     c.fill()
-    // center face-off ring (red)
-    c.strokeStyle = RED_LINE
+    // center face-off ring (red) — washed out
+    c.strokeStyle = RED_LINE_WASH
     c.lineWidth = lw
     c.beginPath()
     c.arc(cx, cy, rBase * 0.16, 0, Math.PI * 2)
@@ -607,7 +648,10 @@ export function createAirHockey(
     if (!(logo.complete && logo.naturalWidth > 0)) return
     const c = ctx!
     const size = geo.rBase * 0.27
-    c.drawImage(logo, geo.cx - size / 2, geo.cy - size / 2, size, size) // fully opaque
+    c.save()
+    c.globalAlpha = 0.5 // washed out — faded into the ice
+    c.drawImage(logo, geo.cx - size / 2, geo.cy - size / 2, size, size)
+    c.restore()
   }
 
   function drawPuck() {
