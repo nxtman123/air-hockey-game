@@ -28,6 +28,9 @@ const COUNTDOWN_MS = 1500 // pre-play countdown (3 → 2 → 1)
 const GOAL_CELEBRATION_MS = 2000 // "<TEAM> SCORES!" / win celebration hold (scrim + input lock)
 const STUCK_MS = 2000 // re-face-off if the puck idles in the unreachable neutral band
 const HOLD_RESET_MS = 2000 // hold a hidden dark-corner hot zone this long to reset to READY
+const POWERUP_DELAY_MS = 5000 // goal-less live play before a power-up appears at center
+const POWERUP_LIFETIME_MS = 8000 // a power-up fades if no paddle grabs it in time
+const MAX_EXTRA_PUCKS = 2 // safety cap so the repeating "two pucks" power-up can't run away
 
 // Team / rink palette
 const RED = '#e23b3b' // Player 1
@@ -132,9 +135,11 @@ export function createAirHockey(
   // on resize via computeGeo().
   let staticLayer: HTMLCanvasElement | null = null
   let puckSprite: { canvas: HTMLCanvasElement; size: number } | null = null
+  let powerUpSprite: { canvas: HTMLCanvasElement; size: number } | null = null
   const paddleSprites: ({ canvas: HTMLCanvasElement; size: number } | null)[] = [null, null]
   let geo: Geo = computeGeo()
   let puck: Matter.Body
+  const extraPucks: Matter.Body[] = [] // transient pucks spawned by the "two pucks" power-up
   let paddles: Matter.Body[] = []
 
   const scores: [number, number] = [0, 0]
@@ -146,6 +151,8 @@ export function createAirHockey(
   let winner = -1
   let slowTimer = 0
   let puckMovedSinceFaceoff = false // a still, never-struck face-off puck is waiting, not stuck
+  let goallessMs = 0 // accumulates during live play; at POWERUP_DELAY_MS a power-up appears
+  let powerUp: { spawnMs: number } | null = null // the "two pucks" badge at center (geo.cx/cy)
 
   // animation clocks (wall-clock ms, refreshed each frame)
   let nowMs = performance.now()
@@ -300,6 +307,28 @@ export function createAirHockey(
       sc.shadowColor = 'rgba(0,0,0,0.35)'
       sc.shadowBlur = r * 0.6
       sc.fill()
+    })
+    // "two pucks" power-up: a glowing yellow disc holding two small puck dots side by side
+    powerUpSprite = buildSprite(powerUpRadius(), powerUpRadius() * 0.7, (sc, cx, cy, r) => {
+      const grad = sc.createRadialGradient(cx, cy, r * 0.1, cx, cy, r)
+      grad.addColorStop(0, '#ffe9b0')
+      grad.addColorStop(0.6, TOS_YELLOW)
+      grad.addColorStop(1, '#d8930f')
+      sc.beginPath()
+      sc.arc(cx, cy, r, 0, Math.PI * 2)
+      sc.fillStyle = grad
+      sc.shadowColor = 'rgba(247,180,53,0.85)'
+      sc.shadowBlur = r * 0.8
+      sc.fill()
+      sc.shadowBlur = 0
+      const dotR = r * 0.26
+      const dx = r * 0.34
+      for (const sign of [-1, 1] as const) {
+        sc.beginPath()
+        sc.arc(cx + sign * dx, cy, dotR, 0, Math.PI * 2)
+        sc.fillStyle = PUCK_COLOR
+        sc.fill()
+      }
     })
     for (const i of [0, 1] as const) {
       const color = i === 0 ? RED : BLUE
@@ -475,14 +504,7 @@ export function createAirHockey(
     Composite.add(engine.world, walls)
 
     const fo = faceoffSpot()
-    puck = Bodies.circle(fo.x, fo.y, geo.puckR, {
-      restitution: 0.98,
-      friction: 0,
-      frictionStatic: 0,
-      frictionAir: 0.006,
-      density: 0.002,
-    })
-    Composite.add(engine.world, puck)
+    puck = makePuck(fo.x, fo.y)
 
     paddles = [0, 1].map((i) =>
       Bodies.circle(homePos(i).x, homePos(i).y, geo.paddleR, {
@@ -495,11 +517,71 @@ export function createAirHockey(
     Composite.add(engine.world, paddles)
   }
 
+  // ── pucks & power-ups ─────────────────────────────────────────────────────────
+  // A puck body — shared by the primary puck and any power-up-spawned extras so they
+  // behave identically.
+  function makePuck(x: number, y: number): Matter.Body {
+    const b = Bodies.circle(x, y, geo.puckR, {
+      restitution: 0.98,
+      friction: 0,
+      frictionStatic: 0,
+      frictionAir: 0.006,
+      density: 0.002,
+    })
+    Composite.add(engine.world, b)
+    return b
+  }
+
+  // "Two pucks" power-up: launch a second puck in along the center line from a random end.
+  function spawnExtraPuck() {
+    if (extraPucks.length >= MAX_EXTRA_PUCKS) return
+    const { left, right, top, bottom, cx, cy, puckR, portrait } = geo
+    const inset = puckR * 2
+    const speed = geo.rBase * 0.03 * 0.85 // just under the step() speed cap
+    const fromStart = Math.random() < 0.5
+    let pos: Matter.Vector
+    let vel: Matter.Vector
+    if (!portrait) {
+      // vertical center line: enter from the top or bottom wall, shoot along it
+      pos = fromStart ? { x: cx, y: top + inset } : { x: cx, y: bottom - inset }
+      vel = { x: 0, y: fromStart ? speed : -speed }
+    } else {
+      // horizontal center line: enter from the left or right wall, shoot along it
+      pos = fromStart ? { x: left + inset, y: cy } : { x: right - inset, y: cy }
+      vel = { x: fromStart ? speed : -speed, y: 0 }
+    }
+    const b = makePuck(pos.x, pos.y)
+    Body.setVelocity(b, vel)
+    extraPucks.push(b)
+  }
+
+  function clearExtraPucks() {
+    for (const b of extraPucks) Composite.remove(engine.world, b)
+    extraPucks.length = 0
+  }
+
+  function powerUpRadius() {
+    return geo.puckR * 1.6
+  }
+
+  function spawnPowerUp() {
+    powerUp = { spawnMs: nowMs }
+  }
+
+  // Drop the power-up and restart the goal-less clock so the next one is a full delay away
+  // (never re-appears moments later).
+  function clearPowerUp() {
+    powerUp = null
+    goallessMs = 0
+  }
+
   // ── match flow ──────────────────────────────────────────────────────────────
   // Face-off: drop the puck STILL. It only moves once struck. A new game faces off
   // dead center; post-goal (and re-drops) sit on the receiving player's blue line.
   function resetPuck(toward: 0 | 1, duration = COUNTDOWN_MS, center = false) {
     scoreFlash = null
+    clearExtraPucks()
+    clearPowerUp()
     serveToward = toward
     centerFaceoff = center
     Body.setPosition(puck, faceoffSpot())
@@ -513,6 +595,8 @@ export function createAirHockey(
   }
 
   function onGoal(scorer: number) {
+    clearExtraPucks() // any goal returns the board to a single puck
+    clearPowerUp()
     scores[scorer]++
     scorePulseAt[scorer] = nowMs // pop the scoreboard digit
     const team: 'red' | 'blue' = scorer === 0 ? 'red' : 'blue'
@@ -542,27 +626,49 @@ export function createAirHockey(
     }
   }
 
-  function checkGoals() {
+  // which team a puck at (x,y) scored for, or -1 if it hasn't crossed a goal line
+  function goalScorerAt(x: number, y: number): number {
     const { left, right, top, bottom, cx, cy, goalLen, puckR } = geo
-    const { x, y } = puck.position
-    let scorer = -1
     if (!geo.portrait) {
       const inMouth = Math.abs(y - cy) < goalLen / 2
-      if (x < left - puckR && inMouth) scorer = 1 // into left (RED) goal → BLUE scores
-      else if (x > right + puckR && inMouth) scorer = 0 // into right (BLUE) goal → RED scores
+      if (x < left - puckR && inMouth) return 1 // into left (RED) goal → BLUE scores
+      if (x > right + puckR && inMouth) return 0 // into right (BLUE) goal → RED scores
     } else {
       const inMouth = Math.abs(x - cx) < goalLen / 2
-      if (y > bottom + puckR && inMouth) scorer = 1 // into bottom (RED) goal → BLUE scores
-      else if (y < top - puckR && inMouth) scorer = 0 // into top (BLUE) goal → RED scores
+      if (y > bottom + puckR && inMouth) return 1 // into bottom (RED) goal → BLUE scores
+      if (y < top - puckR && inMouth) return 0 // into top (BLUE) goal → RED scores
     }
-    if (scorer >= 0) {
-      onGoal(scorer)
+    return -1
+  }
+
+  // a puck that has left the rink without scoring a valid goal
+  function escapedRink(x: number, y: number): boolean {
+    const { left, right, top, bottom, pw, ph } = geo
+    return x < left - pw * 0.2 || x > right + pw * 0.2 || y < top - ph * 0.2 || y > bottom + ph * 0.2
+  }
+
+  function checkGoals() {
+    // any puck (primary or extra) crossing a goal line scores; onGoal resets to a single puck
+    const m = puck.position
+    if (goalScorerAt(m.x, m.y) >= 0) {
+      onGoal(goalScorerAt(m.x, m.y))
       return
     }
-    // failsafe: puck escaped without a valid goal — face off again
-    if (x < left - geo.pw * 0.2 || x > right + geo.pw * 0.2 || y < top - geo.ph * 0.2 || y > bottom + geo.ph * 0.2) {
-      resetPuck(serveToward)
+    for (let k = extraPucks.length - 1; k >= 0; k--) {
+      const p = extraPucks[k].position
+      const s = goalScorerAt(p.x, p.y)
+      if (s >= 0) {
+        onGoal(s)
+        return
+      }
+      // a stray extra puck just disappears — no full face-off
+      if (escapedRink(p.x, p.y)) {
+        Composite.remove(engine.world, extraPucks[k])
+        extraPucks.splice(k, 1)
+      }
     }
+    // failsafe: the primary puck escaped without a valid goal — face off again
+    if (escapedRink(m.x, m.y)) resetPuck(serveToward)
   }
 
   // If the puck stalls in the central band that NO paddle can reach, gently re-face-off
@@ -587,6 +693,8 @@ export function createAirHockey(
   // Wipe the match back to 0–0 with paddles home and fingers released. Shared prelude for
   // both the READY lobby (reset) and an immediate restart (newMatch).
   function clearBoard() {
+    clearExtraPucks()
+    clearPowerUp()
     scores[0] = 0
     scores[1] = 0
     winner = -1
@@ -615,12 +723,6 @@ export function createAirHockey(
   // Leave the READY lobby and begin a fresh centered countdown.
   function startGame() {
     resetPuck(serveToward, COUNTDOWN_MS, true)
-  }
-
-  // Immediate restart after a win: clear the board and count straight down (no READY screen).
-  function newMatch() {
-    clearBoard()
-    startGame()
   }
 
   // ── per-frame simulation ────────────────────────────────────────────────────
@@ -675,16 +777,42 @@ export function createAirHockey(
       if (c.x !== p.position.x || c.y !== p.position.y) Body.setPosition(p, c)
     }
 
-    // cap puck speed to prevent tunneling through rails / goal posts
-    const ps = Math.hypot(puck.velocity.x, puck.velocity.y)
+    // cap every puck's speed to prevent tunneling through rails / goal posts
     const maxp = geo.rBase * 0.03
-    if (ps > maxp) {
-      Body.setVelocity(puck, { x: (puck.velocity.x / ps) * maxp, y: (puck.velocity.y / ps) * maxp })
+    for (const b of [puck, ...extraPucks]) {
+      const ps = Math.hypot(b.velocity.x, b.velocity.y)
+      if (ps > maxp) {
+        Body.setVelocity(b, { x: (b.velocity.x / ps) * maxp, y: (b.velocity.y / ps) * maxp })
+      }
     }
 
     if (phase === 'playing') {
       checkGoals()
       checkStuck()
+      updatePowerUp()
+    }
+  }
+
+  // Drive the "two pucks" power-up: spawn it after enough goal-less play, collect it when a
+  // paddle touches it, or let it time out. The goal-less clock only ticks while no power-up
+  // is pending and the extra-puck cap leaves room.
+  function updatePowerUp() {
+    if (powerUp) {
+      if (nowMs - powerUp.spawnMs > POWERUP_LIFETIME_MS) {
+        clearPowerUp() // faded away uncollected
+        return
+      }
+      const reach = geo.paddleR + powerUpRadius()
+      for (const p of paddles) {
+        if (Math.hypot(p.position.x - geo.cx, p.position.y - geo.cy) < reach) {
+          spawnExtraPuck()
+          clearPowerUp()
+          return
+        }
+      }
+    } else if (puckMovedSinceFaceoff && extraPucks.length < MAX_EXTRA_PUCKS) {
+      goallessMs += PHYS_DT
+      if (goallessMs >= POWERUP_DELAY_MS) spawnPowerUp()
     }
   }
 
@@ -707,7 +835,9 @@ export function createAirHockey(
     else c.clearRect(0, 0, W, H)
 
     drawScoreboard() // per-frame: digits change + brief scale-pop on a goal
+    drawPowerUp() // under the pucks/paddles so a scooping paddle renders on top
     drawPuck()
+    for (const b of extraPucks) drawPuck(b)
     drawPaddle(0)
     drawPaddle(1)
 
@@ -829,10 +959,33 @@ export function createAirHockey(
 
   // Puck and paddles blit their pre-rendered sprites (gradient + shadow baked once per size)
   // centered on the body position — no per-frame gradient/shadow-blur.
-  function drawPuck() {
+  function drawPuck(body: Matter.Body = puck) {
     if (!puckSprite) return
     const half = puckSprite.size / 2
-    ctx!.drawImage(puckSprite.canvas, puck.position.x - half, puck.position.y - half, puckSprite.size, puckSprite.size)
+    ctx!.drawImage(puckSprite.canvas, body.position.x - half, body.position.y - half, puckSprite.size, puckSprite.size)
+  }
+
+  // The "two pucks" power-up at center: a steady glow ring plus the badge with a gentle pulse.
+  function drawPowerUp() {
+    if (!powerUp || !powerUpSprite) return
+    const c = ctx!
+    const { cx, cy } = geo
+    const t = (nowMs - powerUp.spawnMs) / 1000
+    const pulse = 1 + Math.sin(t * 4) * 0.08 // gentle breathing scale
+    const r = powerUpRadius()
+
+    // live glow ring so it reads as "grab me", independent of the baked sprite shadow
+    c.save()
+    c.beginPath()
+    c.arc(cx, cy, r * (1.25 + Math.sin(t * 4) * 0.1), 0, Math.PI * 2)
+    c.strokeStyle = 'rgba(247,180,53,0.55)'
+    c.lineWidth = r * 0.12
+    c.stroke()
+    c.restore()
+
+    const size = powerUpSprite.size * pulse
+    const half = size / 2
+    c.drawImage(powerUpSprite.canvas, cx - half, cy - half, size, size)
   }
 
   function drawPaddle(i: number) {
@@ -1141,7 +1294,7 @@ export function createAirHockey(
     }
     if (inputLocked()) return
     if (phase === 'gameover') {
-      newMatch() // "tap to play again" → straight into the countdown
+      reset() // "tap to play again" → back to the READY lobby
       return
     }
     if (phase === 'ready') {
