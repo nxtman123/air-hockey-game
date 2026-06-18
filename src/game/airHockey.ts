@@ -538,12 +538,15 @@ export function createAirHockey(
     c.fillStyle = iceGrad
     c.fill()
 
-    // texture + markings + goals + logo clipped to the ice
+    // markings + score + texture + goals + logo clipped to the ice
     c.save()
     roundRectPath(c, left, top, pw, ph, cornerR)
     c.clip()
-    if (iceTexture) c.drawImage(iceTexture, left, top, pw, ph) // scratchy scuffs (under the lines)
+    // Paint goes down first (rink lines + score numbers) so the scratchy scuffs ride
+    // OVER it — like real ice paint worn by skates, not lines floating on the scuffs.
     drawMarkings()
+    drawScoreboard()
+    if (iceTexture) c.drawImage(iceTexture, left, top, pw, ph) // skate scuffs over the paint
     drawGoals()
     drawLogo()
     c.restore()
@@ -551,7 +554,6 @@ export function createAirHockey(
     drawPuck()
     drawPaddle(0, RED)
     drawPaddle(1, BLUE)
-    drawScoreboard()
 
     if (phase === 'countdown') drawCountdown()
     else if (phase === 'celebrating') {
@@ -754,21 +756,23 @@ export function createAirHockey(
       const rCenter = start + rw / 2
       const sepCenter = start + rw + gap + sw / 2
       const bCenter = start + rw + gap + sw + gap + bw / 2
+      // Painted-on-the-ice look: faded line-wash colors (matching the rink markings),
+      // no glow. The scratch texture is drawn over these so they read as worn paint.
       // red digit (pops when red scores)
       c.save()
       c.translate(rCenter, 0)
       c.scale(teamPulse(0), teamPulse(0))
-      c.fillStyle = RED
+      c.fillStyle = RED_LINE_WASH
       c.fillText(r, 0, 0)
       c.restore()
       // separator
-      c.fillStyle = 'rgba(0,0,0,0.45)'
+      c.fillStyle = 'rgba(40,55,80,0.3)'
       c.fillText(sep, sepCenter, 0)
       // blue digit (pops when blue scores)
       c.save()
       c.translate(bCenter, 0)
       c.scale(teamPulse(1), teamPulse(1))
-      c.fillStyle = BLUE
+      c.fillStyle = BLUE_LINE_WASH
       c.fillText(b, 0, 0)
       c.restore()
       c.restore()

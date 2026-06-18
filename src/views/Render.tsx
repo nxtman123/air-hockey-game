@@ -27,6 +27,7 @@ export function Render() {
 
     let controller: AirHockeyController | undefined
     let observer: ResizeObserver | undefined
+    let cancelled = false
 
     const logo = new Image()
     logo.src = '/assets/tos-mark.svg'
@@ -35,6 +36,7 @@ export function Render() {
     const broadcast = createBroadcaster()
 
     const start = () => {
+      if (cancelled) return
       controller = createAirHockey(canvas, logo, broadcast)
       observer = new ResizeObserver(() => controller?.resize())
       observer.observe(wrap)
@@ -42,14 +44,34 @@ export function Render() {
       ;(window as unknown as { __airHockey?: AirHockeyController }).__airHockey = controller
     }
 
-    // Wait for the logo so the first frame includes it (errors still start the game).
-    if (logo.complete) start()
-    else {
-      logo.onload = start
-      logo.onerror = start
+    // The canvas text fonts (Orbitron, Inter) are loaded via a Google Fonts <link> in
+    // index.html, but a font file is only fetched lazily when a DOM element uses it — and
+    // a canvas ctx.font assignment does NOT trigger that fetch. So on a fresh device the
+    // canvas would draw in the fallback sans-serif forever. Explicitly request the exact
+    // families/weights airHockey.ts draws with so the browser downloads them. Never block
+    // forever: if the CDN is slow/unreachable the game still starts (with the fallback).
+    const loadCanvasFonts = (): Promise<unknown> => {
+      const fonts = (document as Document & { fonts?: FontFaceSet }).fonts
+      if (!fonts?.load) return Promise.resolve()
+      const want = ["700 1em 'Orbitron'", "600 1em 'Inter'"]
+      const all = Promise.all(want.map((f) => fonts.load(f).catch(() => {})))
+      const timeout = new Promise((r) => setTimeout(r, 3000))
+      return Promise.race([all, timeout])
     }
 
+    // Wait for the logo so the first frame includes it (errors still start the game).
+    const logoReady = new Promise<void>((resolve) => {
+      if (logo.complete) resolve()
+      else {
+        logo.onload = () => resolve()
+        logo.onerror = () => resolve()
+      }
+    })
+
+    Promise.all([logoReady, loadCanvasFonts()]).then(start)
+
     return () => {
+      cancelled = true
       observer?.disconnect()
       controller?.destroy()
       delete (window as unknown as { __airHockey?: AirHockeyController }).__airHockey
