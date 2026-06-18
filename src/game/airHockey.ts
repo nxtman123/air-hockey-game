@@ -35,7 +35,6 @@ const ICE = '#ffffff'
 const OUTSIDE = '#000000'
 const RED_LINE = '#d11f2a'
 const BLUE_LINE = '#1f47d1'
-const BOARDS = '#0e1726'
 const PUCK_COLOR = '#101418'
 
 type Phase = 'countdown' | 'playing' | 'gameover'
@@ -153,7 +152,7 @@ export function createAirHockey(
     ctx!.setTransform(dpr, 0, 0, dpr, 0, 0)
     const rBase = Math.min(W, H)
     const portrait = H > W
-    const margin = rBase * 0.025
+    const margin = 0 // ice extends to the screen edges
     const left = margin
     const top = margin
     const right = W - margin
@@ -173,7 +172,7 @@ export function createAirHockey(
       ph,
       cx: (left + right) / 2,
       cy: (top + bottom) / 2,
-      cornerR: rBase * 0.11,
+      cornerR: rBase * 0.23,
       puckR: rBase * 0.03,
       paddleR: rBase * 0.058,
       wall: rBase * 0.045,
@@ -197,7 +196,7 @@ export function createAirHockey(
 
   // restrict paddle i to its half (kept paddleR away from edges & center line)
   function clampToHalf(i: number, x: number, y: number): Matter.Vector {
-    const { left, right, top, bottom, cx, cy, portrait, paddleR: r } = geo
+    const { left, right, top, bottom, cx, cy, portrait, paddleR: r, cornerR } = geo
     let nx = x
     let ny = y
     if (!portrait) {
@@ -206,6 +205,25 @@ export function createAirHockey(
     } else {
       nx = clamp(nx, left + r, right - r)
       ny = i === 0 ? clamp(ny, cy + r, bottom - r) : clamp(ny, top + r, cy - r)
+    }
+    // keep the paddle off the rounded corners (radial clamp to the ice arc)
+    const corners: [number, number, number, number][] = [
+      [left + cornerR, top + cornerR, -1, -1],
+      [right - cornerR, top + cornerR, 1, -1],
+      [right - cornerR, bottom - cornerR, 1, 1],
+      [left + cornerR, bottom - cornerR, -1, 1],
+    ]
+    for (const [acx, acy, sx, sy] of corners) {
+      if ((nx - acx) * sx > 0 && (ny - acy) * sy > 0) {
+        const dx = nx - acx
+        const dy = ny - acy
+        const d = Math.hypot(dx, dy)
+        const maxD = cornerR - r
+        if (d > maxD && d > 0) {
+          nx = acx + (dx / d) * maxD
+          ny = acy + (dy / d) * maxD
+        }
+      }
     }
     return { x: nx, y: ny }
   }
@@ -219,31 +237,67 @@ export function createAirHockey(
   // ── world construction ────────────────────────────────────────────────────
   function buildWorld() {
     Composite.clear(engine.world, false, true)
-    const { left, right, top, bottom, pw, ph, cx, cy, wall: t, goalLen } = geo
+    const { left, right, top, bottom, pw, ph, cx, cy, wall: t, goalLen, cornerR } = geo
     const half = t / 2
     const walls: Matter.Body[] = []
     const addWall = (wx: number, wy: number, w: number, h: number) => {
       walls.push(Bodies.rectangle(wx, wy, w, h, { isStatic: true, restitution: 1, friction: 0 }))
     }
 
+    // Approximate each rounded corner with thin tangent segments tracing the ice arc
+    // (radius cornerR), so the puck/paddles bounce off the curved edge of the white ice
+    // rather than travelling into the black corner box behind it.
+    const CORNER_SEGS = 10
+    const addCorner = (acx: number, acy: number, a0: number, a1: number) => {
+      for (let k = 0; k < CORNER_SEGS; k++) {
+        const s0 = a0 + ((a1 - a0) * k) / CORNER_SEGS
+        const s1 = a0 + ((a1 - a0) * (k + 1)) / CORNER_SEGS
+        const mid = (s0 + s1) / 2
+        const chord = 2 * cornerR * Math.sin((s1 - s0) / 2)
+        const rc = cornerR + half // inner face sits on the arc (radius cornerR)
+        walls.push(
+          Bodies.rectangle(acx + Math.cos(mid) * rc, acy + Math.sin(mid) * rc, chord + half, t, {
+            isStatic: true,
+            restitution: 1,
+            friction: 0,
+            angle: mid + Math.PI / 2,
+          }),
+        )
+      }
+    }
+    addCorner(left + cornerR, top + cornerR, Math.PI, Math.PI * 1.5) // top-left
+    addCorner(right - cornerR, top + cornerR, Math.PI * 1.5, Math.PI * 2) // top-right
+    addCorner(right - cornerR, bottom - cornerR, 0, Math.PI * 0.5) // bottom-right
+    addCorner(left + cornerR, bottom - cornerR, Math.PI * 0.5, Math.PI) // bottom-left
+
     if (!geo.portrait) {
-      // solid top & bottom; goal mouths centered on left & right edges
-      addWall(cx, top - half, pw + t * 2, t)
-      addWall(cx, bottom + half, pw + t * 2, t)
-      const seg = (ph - goalLen) / 2
-      addWall(left - half, top + seg / 2, t, seg)
-      addWall(left - half, bottom - seg / 2, t, seg)
-      addWall(right + half, top + seg / 2, t, seg)
-      addWall(right + half, bottom - seg / 2, t, seg)
+      // top & bottom rails span between the corners
+      const spanX = pw - cornerR * 2
+      addWall(cx, top - half, spanX, t)
+      addWall(cx, bottom + half, spanX, t)
+      // left & right edges: corner → goal mouth → corner (goal mouth centered at cy)
+      const segTop = cy - goalLen / 2 - (top + cornerR)
+      const segBot = bottom - cornerR - (cy + goalLen / 2)
+      const yTop = (top + cornerR + (cy - goalLen / 2)) / 2
+      const yBot = (cy + goalLen / 2 + (bottom - cornerR)) / 2
+      addWall(left - half, yTop, t, segTop)
+      addWall(left - half, yBot, t, segBot)
+      addWall(right + half, yTop, t, segTop)
+      addWall(right + half, yBot, t, segBot)
     } else {
-      // solid left & right; goal mouths centered on top & bottom edges
-      addWall(left - half, cy, t, ph + t * 2)
-      addWall(right + half, cy, t, ph + t * 2)
-      const seg = (pw - goalLen) / 2
-      addWall(left + seg / 2, top - half, seg, t)
-      addWall(right - seg / 2, top - half, seg, t)
-      addWall(left + seg / 2, bottom + half, seg, t)
-      addWall(right - seg / 2, bottom + half, seg, t)
+      // left & right rails span between the corners
+      const spanY = ph - cornerR * 2
+      addWall(left - half, cy, t, spanY)
+      addWall(right + half, cy, t, spanY)
+      // top & bottom edges: corner → goal mouth → corner (goal mouth centered at cx)
+      const segL = cx - goalLen / 2 - (left + cornerR)
+      const segR = right - cornerR - (cx + goalLen / 2)
+      const xL = (left + cornerR + (cx - goalLen / 2)) / 2
+      const xR = (cx + goalLen / 2 + (right - cornerR)) / 2
+      addWall(xL, top - half, segL, t)
+      addWall(xR, top - half, segR, t)
+      addWall(xL, bottom + half, segL, t)
+      addWall(xR, bottom + half, segR, t)
     }
     Composite.add(engine.world, walls)
 
@@ -426,14 +480,6 @@ export function createAirHockey(
     drawMarkings()
     drawGoals()
     drawLogo()
-    c.restore()
-
-    // boards (rounded rail)
-    c.save()
-    roundRectPath(c, left, top, pw, ph, cornerR)
-    c.strokeStyle = BOARDS
-    c.lineWidth = geo.wall * 0.6
-    c.stroke()
     c.restore()
 
     drawPuck()
