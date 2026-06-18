@@ -580,16 +580,8 @@ export function createAirHockey(
         c.lineTo(x, bottom)
         c.stroke()
       }
-      // red goal lines
-      c.strokeStyle = RED_LINE_WASH
-      c.lineWidth = lw * 0.7
-      for (const x of [left + pw * 0.05, right - pw * 0.05]) {
-        c.beginPath()
-        c.moveTo(x, top)
-        c.lineTo(x, bottom)
-        c.stroke()
-      }
       // red center line — split into two segments that stop at the face-off ring
+      c.strokeStyle = RED_LINE_WASH
       c.lineWidth = lw * 1.4
       c.beginPath()
       c.moveTo(cx, top)
@@ -605,15 +597,8 @@ export function createAirHockey(
         c.lineTo(right, y)
         c.stroke()
       }
-      c.strokeStyle = RED_LINE_WASH
-      c.lineWidth = lw * 0.7
-      for (const y of [top + ph * 0.05, bottom - ph * 0.05]) {
-        c.beginPath()
-        c.moveTo(left, y)
-        c.lineTo(right, y)
-        c.stroke()
-      }
       // red center line — split into two segments that stop at the face-off ring
+      c.strokeStyle = RED_LINE_WASH
       c.lineWidth = lw * 1.4
       c.beginPath()
       c.moveTo(left, cy)
