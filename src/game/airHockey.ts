@@ -19,7 +19,7 @@
 
 import Matter from 'matter-js'
 
-const { Engine, Bodies, Body, Composite } = Matter
+const { Engine, Bodies, Body, Composite, Events } = Matter
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 const WIN_SCORE = 3
@@ -31,6 +31,7 @@ const HOLD_RESET_MS = 2000 // hold a hidden dark-corner hot zone this long to re
 const POWERUP_DELAY_MS = 5000 // goal-less live play before a power-up appears at center
 const POWERUP_LIFETIME_MS = 8000 // a power-up fades if no paddle grabs it in time
 const MAX_EXTRA_PUCKS = 2 // safety cap so the repeating "two pucks" power-up can't run away
+const INVINCIBLE_SPEED_MULT = 1.7 // an invincible puck moves this much faster than the normal cap
 
 // Team / rink palette
 const RED = '#e23b3b' // Player 1
@@ -45,6 +46,9 @@ const PUCK_COLOR = '#101418'
 const TOS_YELLOW = '#F7B435' // TelemetryOS brand yellow — the READY headline
 
 type Phase = 'celebrating' | 'countdown' | 'playing' | 'gameover' | 'ready'
+
+// which random power-up a center badge grants when collected
+type PowerKind = 'two-pucks' | 'invincibility'
 
 interface Geo {
   W: number
@@ -128,6 +132,21 @@ export function createAirHockey(
   engine.gravity.x = 0
   engine.gravity.y = 0
 
+  // An invincible puck's run ends the instant it strikes a wall (it phases through the opponent
+  // paddle, which emits no collisions, so a wall bounce is the only event we can hit here).
+  Events.on(engine, 'collisionStart', (e) => {
+    if (!invincible) return
+    for (const { bodyA, bodyB } of e.pairs) {
+      if (
+        (bodyA === invincible.puck && bodyB.label === 'wall') ||
+        (bodyB === invincible.puck && bodyA.label === 'wall')
+      ) {
+        endInvincible()
+        return
+      }
+    }
+  })
+
   let iceTexture: HTMLCanvasElement | null = null // cached scratchy-ice scuffs (rebuilt on resize)
   // Nothing in the rink moves, so the whole static composite (bg + ice + markings + creases +
   // scuffs + logo) is baked once per size and blitted each frame. The puck/paddle are pre-rendered
@@ -135,7 +154,8 @@ export function createAirHockey(
   // on resize via computeGeo().
   let staticLayer: HTMLCanvasElement | null = null
   let puckSprite: { canvas: HTMLCanvasElement; size: number } | null = null
-  let powerUpSprite: { canvas: HTMLCanvasElement; size: number } | null = null
+  let powerUpSprite: { canvas: HTMLCanvasElement; size: number } | null = null // "two pucks" badge
+  let invincibleSprite: { canvas: HTMLCanvasElement; size: number } | null = null // invincibility badge
   const paddleSprites: ({ canvas: HTMLCanvasElement; size: number } | null)[] = [null, null]
   let geo: Geo = computeGeo()
   let puck: Matter.Body
@@ -152,7 +172,11 @@ export function createAirHockey(
   let slowTimer = 0
   let puckMovedSinceFaceoff = false // a still, never-struck face-off puck is waiting, not stuck
   let goallessMs = 0 // accumulates during live play; at POWERUP_DELAY_MS a power-up appears
-  let powerUp: { spawnMs: number } | null = null // the "two pucks" badge at center (geo.cx/cy)
+  let powerUp: { spawnMs: number; kind: PowerKind } | null = null // the badge at center (geo.cx/cy)
+  // invincibility stage 1: an owner paddle is charged & glowing, waiting to strike the puck
+  let charge: { owner: 0 | 1; sinceMs: number } | null = null
+  // invincibility stage 2: a puck is mid-invincible-run (fast, glowing, phases through opponent)
+  let invincible: { puck: Matter.Body; owner: 0 | 1 } | null = null
 
   // animation clocks (wall-clock ms, refreshed each frame)
   let nowMs = performance.now()
@@ -330,6 +354,33 @@ export function createAirHockey(
         sc.fill()
       }
     })
+    // invincibility power-up: the same glowing amber disc stamped with a white five-point star
+    invincibleSprite = buildSprite(powerUpRadius(), powerUpRadius() * 0.7, (sc, cx, cy, r) => {
+      const grad = sc.createRadialGradient(cx, cy, r * 0.1, cx, cy, r)
+      grad.addColorStop(0, '#ffe9b0')
+      grad.addColorStop(0.6, TOS_YELLOW)
+      grad.addColorStop(1, '#d8930f')
+      sc.beginPath()
+      sc.arc(cx, cy, r, 0, Math.PI * 2)
+      sc.fillStyle = grad
+      sc.shadowColor = 'rgba(247,180,53,0.85)'
+      sc.shadowBlur = r * 0.8
+      sc.fill()
+      sc.shadowBlur = 0
+      const rO = r * 0.62 // outer star radius
+      const rI = r * 0.26 // inner star radius
+      sc.beginPath()
+      for (let k = 0; k < 10; k++) {
+        const rad = k % 2 === 0 ? rO : rI
+        const a = -Math.PI / 2 + (k * Math.PI) / 5
+        const px = cx + Math.cos(a) * rad
+        const py = cy + Math.sin(a) * rad
+        k === 0 ? sc.moveTo(px, py) : sc.lineTo(px, py)
+      }
+      sc.closePath()
+      sc.fillStyle = '#ffffff'
+      sc.fill()
+    })
     for (const i of [0, 1] as const) {
       const color = i === 0 ? RED : BLUE
       paddleSprites[i] = buildSprite(paddleR, paddleR * 0.4, (sc, cx, cy, r) => {
@@ -501,6 +552,7 @@ export function createAirHockey(
       addWall(xL, bottom + half, segL, t)
       addWall(xR, bottom + half, segR, t)
     }
+    for (const w of walls) w.label = 'wall' // so collisionStart can spot an invincible-puck bounce
     Composite.add(engine.world, walls)
 
     const fo = faceoffSpot()
@@ -564,8 +616,41 @@ export function createAirHockey(
     return geo.puckR * 1.6
   }
 
+  // Choose a power-up kind 50/50. If "two pucks" rolls while the extra-puck cap is full, grant
+  // invincibility instead so the cap never silently blocks a power-up from appearing.
   function spawnPowerUp() {
-    powerUp = { spawnMs: nowMs }
+    let kind: PowerKind = Math.random() < 0.5 ? 'two-pucks' : 'invincibility'
+    if (kind === 'two-pucks' && extraPucks.length >= MAX_EXTRA_PUCKS) kind = 'invincibility'
+    powerUp = { spawnMs: nowMs, kind }
+  }
+
+  // Stage 2: the charged owner has just struck `b`. Make it phase through the opponent paddle
+  // (a shared negative collisionFilter.group disables that one pair while leaving walls + the
+  // owner's paddle solid) and shove it off at the invincible speed in its post-hit direction.
+  function launchInvincible(b: Matter.Body, owner: 0 | 1) {
+    invincible = { puck: b, owner }
+    b.collisionFilter.group = -1
+    paddles[1 - owner].collisionFilter.group = -1
+    const fast = geo.rBase * 0.03 * INVINCIBLE_SPEED_MULT
+    let dx = b.velocity.x
+    let dy = b.velocity.y
+    let mag = Math.hypot(dx, dy)
+    if (mag < 1e-3) {
+      // degenerate (barely moving): shoot away from the striking paddle
+      dx = b.position.x - paddles[owner].position.x
+      dy = b.position.y - paddles[owner].position.y
+      mag = Math.hypot(dx, dy) || 1
+    }
+    Body.setVelocity(b, { x: (dx / mag) * fast, y: (dy / mag) * fast })
+    charge = null
+  }
+
+  // End an invincible-puck run: restore normal collision (puck ↔ opponent paddle) and speed cap.
+  function endInvincible() {
+    if (!invincible) return
+    invincible.puck.collisionFilter.group = 0
+    paddles[1 - invincible.owner].collisionFilter.group = 0
+    invincible = null
   }
 
   // Drop the power-up and restart the goal-less clock so the next one is a full delay away
@@ -582,6 +667,8 @@ export function createAirHockey(
     scoreFlash = null
     clearExtraPucks()
     clearPowerUp()
+    endInvincible()
+    charge = null
     serveToward = toward
     centerFaceoff = center
     Body.setPosition(puck, faceoffSpot())
@@ -597,6 +684,8 @@ export function createAirHockey(
   function onGoal(scorer: number) {
     clearExtraPucks() // any goal returns the board to a single puck
     clearPowerUp()
+    endInvincible()
+    charge = null
     scores[scorer]++
     scorePulseAt[scorer] = nowMs // pop the scoreboard digit
     const team: 'red' | 'blue' = scorer === 0 ? 'red' : 'blue'
@@ -777,12 +866,27 @@ export function createAirHockey(
       if (c.x !== p.position.x || c.y !== p.position.y) Body.setPosition(p, c)
     }
 
-    // cap every puck's speed to prevent tunneling through rails / goal posts
+    // invincibility stage 1→2: a charged paddle that touches a puck launches it as the invincible
+    // puck — fast, phasing through the opponent — until it strikes a wall or scores.
+    if (charge && phase === 'playing') {
+      const op = paddles[charge.owner]
+      const contact = geo.paddleR + geo.puckR * 1.3
+      for (const b of [puck, ...extraPucks]) {
+        if (Math.hypot(op.position.x - b.position.x, op.position.y - b.position.y) < contact) {
+          launchInvincible(b, charge.owner)
+          break
+        }
+      }
+    }
+
+    // cap every puck's speed to prevent tunneling through rails / goal posts (the invincible puck
+    // gets a higher cap so its launch boost isn't immediately clamped away)
     const maxp = geo.rBase * 0.03
     for (const b of [puck, ...extraPucks]) {
+      const cap = b === invincible?.puck ? maxp * INVINCIBLE_SPEED_MULT : maxp
       const ps = Math.hypot(b.velocity.x, b.velocity.y)
-      if (ps > maxp) {
-        Body.setVelocity(b, { x: (b.velocity.x / ps) * maxp, y: (b.velocity.y / ps) * maxp })
+      if (ps > cap) {
+        Body.setVelocity(b, { x: (b.velocity.x / ps) * cap, y: (b.velocity.y / ps) * cap })
       }
     }
 
@@ -793,9 +897,9 @@ export function createAirHockey(
     }
   }
 
-  // Drive the "two pucks" power-up: spawn it after enough goal-less play, collect it when a
-  // paddle touches it, or let it time out. The goal-less clock only ticks while no power-up
-  // is pending and the extra-puck cap leaves room.
+  // Drive the power-up: spawn it after enough goal-less play, grant its effect when a paddle
+  // touches it, or let it time out. The goal-less clock only ticks while no power-up is pending,
+  // no invincibility effect is in progress, and the extra-puck cap leaves room.
   function updatePowerUp() {
     if (powerUp) {
       if (nowMs - powerUp.spawnMs > POWERUP_LIFETIME_MS) {
@@ -803,14 +907,16 @@ export function createAirHockey(
         return
       }
       const reach = geo.paddleR + powerUpRadius()
-      for (const p of paddles) {
+      for (let i = 0; i < paddles.length; i++) {
+        const p = paddles[i]
         if (Math.hypot(p.position.x - geo.cx, p.position.y - geo.cy) < reach) {
-          spawnExtraPuck()
+          if (powerUp.kind === 'two-pucks') spawnExtraPuck()
+          else charge = { owner: i as 0 | 1, sinceMs: nowMs } // arm this paddle for an invincible strike
           clearPowerUp()
           return
         }
       }
-    } else if (puckMovedSinceFaceoff && extraPucks.length < MAX_EXTRA_PUCKS) {
+    } else if (puckMovedSinceFaceoff && !charge && !invincible && extraPucks.length < MAX_EXTRA_PUCKS) {
       goallessMs += PHYS_DT
       if (goallessMs >= POWERUP_DELAY_MS) spawnPowerUp()
     }
@@ -957,17 +1063,35 @@ export function createAirHockey(
     c.restore()
   }
 
+  // The invincibility effect's signature: a fast-flashing amber ring with a soft amber glow,
+  // shared by the charged paddle (stage 1) and the invincible puck (stage 2).
+  function drawAmberFlash(x: number, y: number, radius: number) {
+    const c = ctx!
+    const flash = 0.35 + 0.45 * Math.abs(Math.sin((nowMs / 1000) * 8)) // fast flash 0.35 → 0.8
+    c.save()
+    c.beginPath()
+    c.arc(x, y, radius, 0, Math.PI * 2)
+    c.strokeStyle = `rgba(247,180,53,${flash})`
+    c.lineWidth = radius * 0.22
+    c.shadowColor = 'rgba(247,180,53,0.9)'
+    c.shadowBlur = radius * 0.8
+    c.stroke()
+    c.restore()
+  }
+
   // Puck and paddles blit their pre-rendered sprites (gradient + shadow baked once per size)
   // centered on the body position — no per-frame gradient/shadow-blur.
   function drawPuck(body: Matter.Body = puck) {
     if (!puckSprite) return
     const half = puckSprite.size / 2
     ctx!.drawImage(puckSprite.canvas, body.position.x - half, body.position.y - half, puckSprite.size, puckSprite.size)
+    if (body === invincible?.puck) drawAmberFlash(body.position.x, body.position.y, geo.puckR * 1.6)
   }
 
-  // The "two pucks" power-up at center: a steady glow ring plus the badge with a gentle pulse.
+  // The power-up at center: a steady glow ring plus the kind's badge with a gentle pulse.
   function drawPowerUp() {
-    if (!powerUp || !powerUpSprite) return
+    const sprite = powerUp?.kind === 'invincibility' ? invincibleSprite : powerUpSprite
+    if (!powerUp || !sprite) return
     const c = ctx!
     const { cx, cy } = geo
     const t = (nowMs - powerUp.spawnMs) / 1000
@@ -983,9 +1107,9 @@ export function createAirHockey(
     c.stroke()
     c.restore()
 
-    const size = powerUpSprite.size * pulse
+    const size = sprite.size * pulse
     const half = size / 2
-    c.drawImage(powerUpSprite.canvas, cx - half, cy - half, size, size)
+    c.drawImage(sprite.canvas, cx - half, cy - half, size, size)
   }
 
   function drawPaddle(i: number) {
@@ -993,6 +1117,7 @@ export function createAirHockey(
     if (!sp) return
     const p = paddles[i]
     const half = sp.size / 2
+    if (charge?.owner === i) drawAmberFlash(p.position.x, p.position.y, geo.paddleR * 1.2) // charged
     ctx!.drawImage(sp.canvas, p.position.x - half, p.position.y - half, sp.size, sp.size)
   }
 
