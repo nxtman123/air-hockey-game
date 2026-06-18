@@ -31,7 +31,6 @@ const STUCK_MS = 2000 // re-face-off if the puck idles in the unreachable neutra
 // Team / rink palette
 const RED = '#e23b3b' // Player 1
 const BLUE = '#2f6bff' // Player 2
-const ICE = '#d6e1f1' // icy blue
 const ICE_EDGE = '#cfdcef' // bluer near the rink edges (gradient)
 const ICE_MID = '#dde8f5' // lighter toward the middle
 const OUTSIDE = '#000000'
@@ -136,6 +135,7 @@ export function createAirHockey(
   let centerFaceoff = false // new game → puck dead center; after a goal → receiver's blue line
   let winner = -1
   let slowTimer = 0
+  let puckMovedSinceFaceoff = false // a still, never-struck face-off puck is waiting, not stuck
 
   // animation clocks (wall-clock ms, refreshed each frame)
   let nowMs = performance.now()
@@ -374,6 +374,7 @@ export function createAirHockey(
     phaseTimer = duration
     phaseDuration = duration
     slowTimer = 0
+    puckMovedSinceFaceoff = false
   }
 
   function onGoal(scorer: number) {
@@ -401,6 +402,7 @@ export function createAirHockey(
       phaseTimer = GOAL_CELEBRATION_MS
       phaseDuration = GOAL_CELEBRATION_MS
       slowTimer = 0
+      puckMovedSinceFaceoff = false
     }
   }
 
@@ -431,11 +433,14 @@ export function createAirHockey(
   // it (still — never relaunched at speed). A stalled puck elsewhere is left for a player to hit.
   function checkStuck() {
     const sp = Math.hypot(puck.velocity.x, puck.velocity.y)
+    const moveThresh = geo.rBase * 0.0025
+    if (sp >= moveThresh) puckMovedSinceFaceoff = true
+    if (!puckMovedSinceFaceoff) return // fresh face-off: waiting to be struck, not stuck
     const band = geo.paddleR + geo.puckR
     const inNeutral = !geo.portrait
       ? Math.abs(puck.position.x - geo.cx) < band
       : Math.abs(puck.position.y - geo.cy) < band
-    if (sp < geo.rBase * 0.0025 && inNeutral) {
+    if (sp < moveThresh && inNeutral) {
       slowTimer += PHYS_DT
       if (slowTimer > STUCK_MS) resetPuck(((serveToward + 1) % 2) as 0 | 1)
     } else {
@@ -559,6 +564,7 @@ export function createAirHockey(
     const c = ctx!
     const { left, right, top, bottom, cx, cy, pw, ph, rBase, portrait } = geo
     const lw = Math.max(2, rBase * 0.01)
+    const ringR = rBase * 0.16 // center face-off ring radius (red center line stops here)
     c.lineWidth = lw
 
     // washed-out markings use pre-faded pastel colors (full opacity) so overlapping
@@ -581,10 +587,12 @@ export function createAirHockey(
         c.lineTo(x, bottom)
         c.stroke()
       }
-      // red center line
+      // red center line — split into two segments that stop at the face-off ring
       c.lineWidth = lw * 1.4
       c.beginPath()
       c.moveTo(cx, top)
+      c.lineTo(cx, cy - ringR)
+      c.moveTo(cx, cy + ringR)
       c.lineTo(cx, bottom)
       c.stroke()
     } else {
@@ -603,23 +611,21 @@ export function createAirHockey(
         c.lineTo(right, y)
         c.stroke()
       }
+      // red center line — split into two segments that stop at the face-off ring
       c.lineWidth = lw * 1.4
       c.beginPath()
       c.moveTo(left, cy)
+      c.lineTo(cx - ringR, cy)
+      c.moveTo(cx + ringR, cy)
       c.lineTo(right, cy)
       c.stroke()
     }
 
-    // clean ice face-off spot so the logo reads clearly over the lines
-    c.beginPath()
-    c.arc(cx, cy, rBase * 0.16, 0, Math.PI * 2)
-    c.fillStyle = ICE
-    c.fill()
-    // center face-off ring (red) — washed out
+    // center face-off ring (red) — washed out; ice texture/gradient/logo show through
     c.strokeStyle = RED_LINE_WASH
     c.lineWidth = lw
     c.beginPath()
-    c.arc(cx, cy, rBase * 0.16, 0, Math.PI * 2)
+    c.arc(cx, cy, ringR, 0, Math.PI * 2)
     c.stroke()
   }
 
