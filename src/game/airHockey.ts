@@ -25,7 +25,7 @@ const { Engine, Bodies, Body, Composite } = Matter
 const WIN_SCORE = 3
 const PHYS_DT = 1000 / 60 // fixed physics step (ms)
 const COUNTDOWN_MS = 1500 // pre-play countdown (3 → 2 → 1)
-const GOAL_CELEBRATION_MS = 5000 // "<TEAM> SCORES!" message + animation hold after a goal
+const GOAL_CELEBRATION_MS = 3000 // "<TEAM> SCORES!" / win celebration hold (scrim + input lock)
 const STUCK_MS = 2000 // re-face-off if the puck idles in the unreachable neutral band
 
 // Team / rink palette
@@ -37,7 +37,7 @@ const RED_LINE = '#d11f2a'
 const BLUE_LINE = '#1f47d1'
 const PUCK_COLOR = '#101418'
 
-type Phase = 'countdown' | 'playing' | 'gameover'
+type Phase = 'celebrating' | 'countdown' | 'playing' | 'gameover'
 
 interface Geo {
   W: number
@@ -129,6 +129,7 @@ export function createAirHockey(
   let phaseTimer = COUNTDOWN_MS
   let phaseDuration = COUNTDOWN_MS // full length of the current countdown (for anim progress)
   let serveToward: 0 | 1 = 0 // half the puck is faced-off into (the receiver)
+  let centerFaceoff = false // new game → puck dead center; after a goal → receiver's blue line
   let winner = -1
   let slowTimer = 0
 
@@ -187,11 +188,17 @@ export function createAirHockey(
     return i === 0 ? { x: cx, y: bottom - ph * 0.22 } : { x: cx, y: top + ph * 0.22 }
   }
 
-  // stationary face-off point inside the receiving player's half (reachable by them)
+  // post-goal face-off point: on the receiving player's blue line (reachable by them)
   function faceoffPoint(side: 0 | 1): Matter.Vector {
-    const { left, top, pw, ph, cx, cy, portrait } = geo
-    if (!portrait) return { x: side === 0 ? left + pw * 0.25 : left + pw * 0.75, y: cy }
-    return { x: cx, y: side === 0 ? top + ph * 0.75 : top + ph * 0.25 }
+    const { pw, ph, cx, cy, portrait } = geo
+    if (!portrait) return { x: side === 0 ? cx - pw * 0.17 : cx + pw * 0.17, y: cy }
+    return { x: cx, y: side === 0 ? cy + ph * 0.17 : cy - ph * 0.17 }
+  }
+
+  // where the puck rests at the current face-off — recomputed from geo so it survives
+  // a resize/buildWorld rebuild. Dead center for a new game, blue line after a goal.
+  function faceoffSpot(): Matter.Vector {
+    return centerFaceoff ? { x: geo.cx, y: geo.cy } : faceoffPoint(serveToward)
   }
 
   // restrict paddle i to its half (kept paddleR away from edges & center line)
@@ -301,7 +308,7 @@ export function createAirHockey(
     }
     Composite.add(engine.world, walls)
 
-    const fo = faceoffPoint(serveToward)
+    const fo = faceoffSpot()
     puck = Bodies.circle(fo.x, fo.y, geo.puckR, {
       restitution: 0.98,
       friction: 0,
@@ -323,14 +330,15 @@ export function createAirHockey(
   }
 
   // ── match flow ──────────────────────────────────────────────────────────────
-  // Face-off: drop the puck STILL into a half. It only moves once struck.
-  function resetPuck(toward: 0 | 1, duration = COUNTDOWN_MS) {
+  // Face-off: drop the puck STILL. It only moves once struck. A new game faces off
+  // dead center; post-goal (and re-drops) sit on the receiving player's blue line.
+  function resetPuck(toward: 0 | 1, duration = COUNTDOWN_MS, center = false) {
     scoreFlash = null
-    const fo = faceoffPoint(toward)
-    Body.setPosition(puck, fo)
+    serveToward = toward
+    centerFaceoff = center
+    Body.setPosition(puck, faceoffSpot())
     Body.setVelocity(puck, { x: 0, y: 0 })
     Body.setAngularVelocity(puck, 0)
-    serveToward = toward
     phase = 'countdown'
     phaseTimer = duration
     phaseDuration = duration
@@ -350,9 +358,18 @@ export function createAirHockey(
       Body.setVelocity(puck, { x: 0, y: 0 })
       onEvent?.({ type: 'win', team, red: scores[0], blue: scores[1] })
     } else {
-      // hold the "<TEAM> SCORES!" celebration for 5s before play resumes
-      resetPuck((1 - scorer) as 0 | 1, GOAL_CELEBRATION_MS)
+      // hold the "<TEAM> SCORES!" celebration (scrim + frozen input); a fresh countdown
+      // then runs before play resumes. Park the puck on the receiver's blue line.
+      serveToward = (1 - scorer) as 0 | 1
+      centerFaceoff = false
+      Body.setPosition(puck, faceoffSpot())
+      Body.setVelocity(puck, { x: 0, y: 0 })
+      Body.setAngularVelocity(puck, 0)
       scoreFlash = { team: scorer as 0 | 1, startMs: nowMs }
+      phase = 'celebrating'
+      phaseTimer = GOAL_CELEBRATION_MS
+      phaseDuration = GOAL_CELEBRATION_MS
+      slowTimer = 0
     }
   }
 
@@ -405,24 +422,29 @@ export function createAirHockey(
     })
     targets[0] = null
     targets[1] = null
-    resetPuck(serveToward)
+    resetPuck(serveToward, COUNTDOWN_MS, true) // new game: puck dead center
   }
 
   // ── per-frame simulation ────────────────────────────────────────────────────
   function step() {
-    if (phase === 'countdown') {
+    if (phase === 'celebrating') {
+      // "<TEAM> SCORES!" + scrim holds for the full window, then a fresh countdown runs
       phaseTimer -= PHYS_DT
-      if (phaseTimer <= 0) {
-        phase = 'playing' // puck stays put; players must strike it
-        scoreFlash = null
-      }
+      if (phaseTimer <= 0) resetPuck(serveToward)
+    } else if (phase === 'countdown') {
+      phaseTimer -= PHYS_DT
+      if (phaseTimer <= 0) phase = 'playing' // puck stays put; players must strike it
     }
+
+    // puck is strikeable only during play; a sensor (pass-through) otherwise so nobody
+    // can jump the gun by hitting it during the countdown or celebration
+    puck.isSensor = phase !== 'playing'
 
     // velocity-chase paddles toward fingers
     for (let i = 0; i < 2; i++) {
       const p = paddles[i]
       const tgt = targets[i]
-      if (tgt && phase !== 'gameover') {
+      if (tgt && phase !== 'gameover' && phase !== 'celebrating') {
         let vx = (tgt.x - p.position.x) * 0.4
         let vy = (tgt.y - p.position.y) * 0.4
         const maxv = geo.rBase * 0.05
@@ -488,7 +510,10 @@ export function createAirHockey(
     drawScoreboard()
 
     if (phase === 'countdown') drawCountdown()
-    else if (phase === 'gameover') drawWinner()
+    else if (phase === 'celebrating') {
+      drawScrim()
+      drawScoreFlash()
+    } else if (phase === 'gameover') drawWinner()
   }
 
   function drawMarkings() {
@@ -701,11 +726,6 @@ export function createAirHockey(
   }
 
   function drawCountdown() {
-    // After a goal the countdown window hosts the "<TEAM> SCORES!" celebration instead.
-    if (scoreFlash) {
-      drawScoreFlash()
-      return
-    }
     const c = ctx!
     const n = Math.max(1, Math.ceil(phaseTimer / 500))
     // progress within the current 1s digit (0 = just appeared → 1 = about to switch)
@@ -788,15 +808,20 @@ export function createAirHockey(
     }
   }
 
-  function drawWinner() {
+  // White wash over the ice — used for the goal celebration and the game-over banner.
+  function drawScrim() {
     const c = ctx!
-    // dim the ice
     c.save()
     roundRectPath(c, geo.left, geo.top, geo.pw, geo.ph, geo.cornerR)
     c.clip()
     c.fillStyle = 'rgba(255,255,255,0.7)'
     c.fillRect(0, 0, geo.W, geo.H)
     c.restore()
+  }
+
+  function drawWinner() {
+    const c = ctx!
+    drawScrim()
 
     const color = winner === 0 ? RED : BLUE
     const team = `${winner === 0 ? 'RED' : 'BLUE'} WINS`
@@ -805,7 +830,9 @@ export function createAirHockey(
     const slideX = (1 - e) * geo.rBase * 1.9 // streaks in from the side
     const speed = 1 - e
     const stretchX = 1 + speed * 1.6
-    const tapAlpha = 0.35 + 0.35 * (0.5 + 0.5 * Math.sin(nowMs / 600)) // slow steady fade
+    // the prompt only appears after the full celebration window, then fades in
+    const promptIn = clamp((nowMs - winStartMs - GOAL_CELEBRATION_MS) / 400, 0, 1)
+    const tapAlpha = (0.35 + 0.35 * (0.5 + 0.5 * Math.sin(nowMs / 600))) * promptIn // slow steady fade
     for (const p of countdownPlacements()) {
       c.save()
       c.translate(p.x, p.y)
@@ -818,8 +845,8 @@ export function createAirHockey(
       c.font = `700 ${geo.rBase * 0.08}px 'Orbitron', sans-serif`
       drawStreakText(team, color, e, slideX, stretchX, speed)
       c.restore()
-      // steady prompt (fades in once the headline has arrived)
-      c.fillStyle = `rgba(20,30,45,${tapAlpha * e})`
+      // steady prompt (fades in once the 5s celebration window has passed)
+      c.fillStyle = `rgba(20,30,45,${tapAlpha})`
       c.font = `600 ${geo.rBase * 0.03}px 'Inter', sans-serif`
       c.fillText('Tap to play again', 0, geo.rBase * 0.05)
       c.restore()
@@ -827,6 +854,12 @@ export function createAirHockey(
   }
 
   // ── input ────────────────────────────────────────────────────────────────────
+  // All input is swallowed for the full 5s of a goal celebration and a game-over banner.
+  function inputLocked(): boolean {
+    if (phase === 'gameover') return nowMs - winStartMs < GOAL_CELEBRATION_MS
+    return phase === 'celebrating'
+  }
+
   function toLocal(e: PointerEvent): Matter.Vector {
     const rect = canvas.getBoundingClientRect()
     return { x: e.clientX - rect.left, y: e.clientY - rect.top }
@@ -834,6 +867,7 @@ export function createAirHockey(
 
   function onDown(e: PointerEvent) {
     e.preventDefault()
+    if (inputLocked()) return
     if (phase === 'gameover') {
       reset()
       return
