@@ -25,7 +25,7 @@ const { Engine, Bodies, Body, Composite } = Matter
 const WIN_SCORE = 3
 const PHYS_DT = 1000 / 60 // fixed physics step (ms)
 const COUNTDOWN_MS = 1500 // pre-play countdown (3 → 2 → 1)
-const GOAL_CELEBRATION_MS = 3000 // "<TEAM> SCORES!" / win celebration hold (scrim + input lock)
+const GOAL_CELEBRATION_MS = 2000 // "<TEAM> SCORES!" / win celebration hold (scrim + input lock)
 const STUCK_MS = 2000 // re-face-off if the puck idles in the unreachable neutral band
 
 // Team / rink palette
