@@ -789,9 +789,9 @@ export function createAirHockey(
     ]
   }
 
-  function countdownPlacements(): Placement[] {
+  function countdownPlacements(spread = 0.2): Placement[] {
     const { cx, cy, rBase, portrait } = geo
-    const d = rBase * 0.2
+    const d = rBase * spread
     if (!portrait) {
       return [
         { x: cx - d, y: cy, angle: Math.PI / 2 }, // faces RED end (left)
@@ -887,9 +887,12 @@ export function createAirHockey(
   // along its reading axis (slideX), stretches while moving fast (stretchX), and trails
   // faint motion-blur echoes behind it. Caller sets font + textAlign/baseline and the
   // translate/rotate placement. `speed` is the current motion magnitude (0 = parked).
-  function drawStreakText(text: string, color: string, alpha: number, slideX: number, stretchX: number, speed: number) {
+  function drawStreakText(text: string, color: string, alpha: number, slideX: number, stretchX: number, speed: number, lineHeight = 0) {
     const c = ctx!
     if (alpha <= 0.01) return
+    const lines = text.split('\n')
+    const y0 = -((lines.length - 1) / 2) * lineHeight
+    const fillLines = () => lines.forEach((ln, i) => c.fillText(ln, 0, y0 + i * lineHeight))
     if (speed > 0.04) {
       for (let g = 3; g >= 1; g--) {
         c.save()
@@ -897,7 +900,7 @@ export function createAirHockey(
         c.translate(slideX + speed * geo.rBase * 0.25 * g, 0)
         c.scale(stretchX, 1)
         c.fillStyle = color
-        c.fillText(text, 0, 0)
+        fillLines()
         c.restore()
       }
     }
@@ -908,7 +911,7 @@ export function createAirHockey(
     c.shadowColor = color
     c.shadowBlur = geo.rBase * 0.03
     c.fillStyle = color
-    c.fillText(text, 0, 0)
+    fillLines()
     c.restore()
   }
 
@@ -955,7 +958,7 @@ export function createAirHockey(
     drawScrim()
 
     const color = winner === 0 ? RED : BLUE
-    const team = `${winner === 0 ? 'RED' : 'BLUE'} WINS`
+    const team = `${winner === 0 ? 'RED' : 'BLUE'}\nWINS!`
     const inT = clamp((nowMs - winStartMs) / 450, 0, 1)
     const e = easeOutExpo(inT) // fast zoom-in, then dead steady (no breathing)
     const slideX = (1 - e) * geo.rBase * 1.9 // streaks in from the side
@@ -964,7 +967,7 @@ export function createAirHockey(
     // the prompt only appears after the full celebration window, then fades in
     const promptIn = clamp((nowMs - winStartMs - GOAL_CELEBRATION_MS) / 400, 0, 1)
     const tapAlpha = (0.35 + 0.35 * (0.5 + 0.5 * Math.sin(nowMs / 600))) * promptIn // slow steady fade
-    for (const p of countdownPlacements()) {
+    for (const p of countdownPlacements(0.34)) {
       c.save()
       c.translate(p.x, p.y)
       c.rotate(p.angle)
@@ -973,13 +976,13 @@ export function createAirHockey(
       // headline streaks in along its reading axis
       c.save()
       c.translate(0, -geo.rBase * 0.03)
-      c.font = `700 ${geo.rBase * 0.08}px 'Orbitron', sans-serif`
-      drawStreakText(team, color, e, slideX, stretchX, speed)
+      c.font = `700 ${geo.rBase * 0.16}px 'Orbitron', sans-serif`
+      drawStreakText(team, color, e, slideX, stretchX, speed, geo.rBase * 0.17)
       c.restore()
       // steady prompt (fades in once the 5s celebration window has passed)
       c.fillStyle = `rgba(20,30,45,${tapAlpha})`
       c.font = `600 ${geo.rBase * 0.03}px 'Inter', sans-serif`
-      c.fillText('Tap to play again', 0, geo.rBase * 0.05)
+      c.fillText('Tap to play again', 0, geo.rBase * 0.18)
       c.restore()
     }
   }
