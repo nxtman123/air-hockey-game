@@ -546,8 +546,8 @@ export function createAirHockey(
     // OVER it — like real ice paint worn by skates, not lines floating on the scuffs.
     drawMarkings()
     drawScoreboard()
+    drawGoals() // crease paint
     if (iceTexture) c.drawImage(iceTexture, left, top, pw, ph) // skate scuffs over the paint
-    drawGoals()
     drawLogo()
     c.restore()
 
@@ -631,24 +631,40 @@ export function createAirHockey(
     c.stroke()
   }
 
+  // The net itself sits at the screen edge (off-screen), so instead of a literal goal
+  // box we paint a hockey "crease" — a faded half-circle on the ice in front of each
+  // net, bulging inward from the goal line. Purely cosmetic (scoring/bounce geometry is
+  // unchanged); painted under the ice texture like the rink lines.
   function drawGoals() {
-    const { left, right, top, bottom, cx, cy, goalLen, wall: t } = geo
+    const { left, right, top, bottom, cx, cy, goalLen } = geo
+    const r = goalLen / 2 // crease spans the goal mouth
+    const HALF = Math.PI / 2
     if (!geo.portrait) {
-      paintGoal(left, cy - goalLen / 2, t, goalLen, RED)
-      paintGoal(right - t, cy - goalLen / 2, t, goalLen, BLUE)
+      paintCrease(left, cy, r, RED_LINE_WASH, -HALF, HALF) // opens right, into the ice
+      paintCrease(right, cy, r, BLUE_LINE_WASH, HALF, 3 * HALF) // opens left
     } else {
-      paintGoal(cx - goalLen / 2, bottom - t, goalLen, t, RED)
-      paintGoal(cx - goalLen / 2, top, goalLen, t, BLUE)
+      paintCrease(cx, bottom, r, RED_LINE_WASH, Math.PI, 2 * Math.PI) // opens up
+      paintCrease(cx, top, r, BLUE_LINE_WASH, 0, Math.PI) // opens down
     }
   }
 
-  function paintGoal(x: number, y: number, w: number, h: number, color: string) {
+  function paintCrease(x: number, y: number, r: number, color: string, a0: number, a1: number) {
     const c = ctx!
     c.save()
+    // faded ice tint inside the crease
+    c.globalAlpha = 0.32
     c.fillStyle = color
-    c.shadowColor = color
-    c.shadowBlur = geo.rBase * 0.045
-    c.fillRect(x, y, w, h)
+    c.beginPath()
+    c.arc(x, y, r, a0, a1)
+    c.closePath() // chord along the goal line closes the half-disc
+    c.fill()
+    // painted arc edge for definition
+    c.globalAlpha = 0.85
+    c.lineWidth = Math.max(2, geo.rBase * 0.01)
+    c.strokeStyle = color
+    c.beginPath()
+    c.arc(x, y, r, a0, a1)
+    c.stroke()
     c.restore()
   }
 
