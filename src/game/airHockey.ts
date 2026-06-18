@@ -585,9 +585,9 @@ export function createAirHockey(
       const p = paddles[i]
       const tgt = targets[i]
       if (tgt && phase !== 'gameover' && phase !== 'celebrating') {
-        let vx = (tgt.x - p.position.x) * 0.4
-        let vy = (tgt.y - p.position.y) * 0.4
-        const maxv = geo.rBase * 0.05
+        let vx = (tgt.x - p.position.x) * 0.7
+        let vy = (tgt.y - p.position.y) * 0.7
+        const maxv = geo.rBase * 0.08
         const sp = Math.hypot(vx, vy)
         if (sp > maxv) {
           vx = (vx / sp) * maxv
