@@ -485,15 +485,16 @@ export function createAirHockey(
     scores[scorer]++
     scorePulseAt[scorer] = nowMs // pop the scoreboard digit
     const team: 'red' | 'blue' = scorer === 0 ? 'red' : 'blue'
-    onEvent?.({ type: 'goal', team, red: scores[0], blue: scores[1] })
     if (scores[scorer] >= WIN_SCORE) {
       winner = scorer
       winStartMs = nowMs
       phase = 'gameover'
       Body.setPosition(puck, { x: geo.cx, y: geo.cy })
       Body.setVelocity(puck, { x: 0, y: 0 })
+      // the winning goal broadcasts only "<TEAM> WINS!" — no redundant "SCORES!" first
       onEvent?.({ type: 'win', team, red: scores[0], blue: scores[1] })
     } else {
+      onEvent?.({ type: 'goal', team, red: scores[0], blue: scores[1] })
       // hold the "<TEAM> SCORES!" celebration (scrim + frozen input); a fresh countdown
       // then runs before play resumes. Park the puck on the receiver's blue line.
       serveToward = (1 - scorer) as 0 | 1
