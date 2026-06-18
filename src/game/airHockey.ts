@@ -28,7 +28,7 @@ const COUNTDOWN_MS = 1500 // pre-play countdown (3 → 2 → 1)
 const GOAL_CELEBRATION_MS = 2000 // "<TEAM> SCORES!" / win celebration hold (scrim + input lock)
 const STUCK_MS = 2000 // re-face-off if the puck idles in the unreachable neutral band
 const HOLD_RESET_MS = 2000 // hold a hidden dark-corner hot zone this long to reset to READY
-const POWERUP_DELAY_MS = 5000 // goal-less live play before a power-up appears at center
+const POWERUP_DELAY_MS = 3000 // goal-less live play before a power-up appears
 const POWERUP_LIFETIME_MS = 8000 // a power-up fades if no paddle grabs it in time
 const MAX_EXTRA_PUCKS = 2 // safety cap so the repeating "two pucks" power-up can't run away
 const INVINCIBLE_SPEED_MULT = 1.7 // an invincible puck moves this much faster than the normal cap
@@ -158,7 +158,8 @@ export function createAirHockey(
   let slowTimer = 0
   let puckMovedSinceFaceoff = false // a still, never-struck face-off puck is waiting, not stuck
   let goallessMs = 0 // accumulates during live play; at POWERUP_DELAY_MS a power-up appears
-  let powerUp: { spawnMs: number; kind: PowerKind } | null = null // the badge at center (geo.cx/cy)
+  // the badge: enters from a rink edge and drifts around the neutral zone (between the blue lines)
+  let powerUp: { spawnMs: number; kind: PowerKind; x: number; y: number; vx: number; vy: number } | null = null
   // invincibility stage 1: an owner paddle is charged & glowing, waiting to strike the puck
   let charge: { owner: 0 | 1; sinceMs: number } | null = null
   // invincibility stage 2: a puck is mid-invincible-run (fast, glowing, phases through opponent)
@@ -601,12 +602,43 @@ export function createAirHockey(
     return geo.puckR * 1.6
   }
 
-  // Choose a power-up kind 50/50. If "two pucks" rolls while the extra-puck cap is full, grant
-  // invincibility instead so the cap never silently blocks a power-up from appearing.
+  // The neutral zone (between the two blue lines) the power-up drifts inside, inset by its radius
+  // so the badge stays fully on-ice as it bounces. Landscape: a vertical band spanning top↔bottom;
+  // portrait: a horizontal band spanning left↔right.
+  function neutralZone() {
+    const { left, right, top, bottom, cx, cy, pw, ph, portrait } = geo
+    const r = powerUpRadius()
+    if (!portrait) {
+      return { minX: cx - pw * 0.17 + r, maxX: cx + pw * 0.17 - r, minY: top + r, maxY: bottom - r }
+    }
+    return { minX: left + r, maxX: right - r, minY: cy - ph * 0.17 + r, maxY: cy + ph * 0.17 - r }
+  }
+
+  // Choose a power-up kind 50/50 (two-pucks falls back to invincibility when extras are maxed),
+  // then send it drifting in from a rink edge within the neutral zone at a gentle inward angle.
   function spawnPowerUp() {
     let kind: PowerKind = Math.random() < 0.5 ? 'two-pucks' : 'invincibility'
     if (kind === 'two-pucks' && extraPucks.length >= MAX_EXTRA_PUCKS) kind = 'invincibility'
-    powerUp = { spawnMs: nowMs, kind }
+    const z = neutralZone()
+    const speed = geo.rBase * 0.005 // slow float
+    const a = (0.25 + Math.random() * 0.5) * Math.PI // inward heading, 45°–135° off the entry edge
+    let x: number, y: number, vx: number, vy: number
+    if (!geo.portrait) {
+      // enter from the top or bottom rink edge, drift down/up into the band
+      const fromTop = Math.random() < 0.5
+      x = z.minX + Math.random() * (z.maxX - z.minX)
+      y = fromTop ? z.minY : z.maxY
+      vx = Math.cos(a) * speed
+      vy = (fromTop ? 1 : -1) * Math.sin(a) * speed
+    } else {
+      // enter from the left or right rink edge, drift right/left into the band
+      const fromLeft = Math.random() < 0.5
+      y = z.minY + Math.random() * (z.maxY - z.minY)
+      x = fromLeft ? z.minX : z.maxX
+      vx = (fromLeft ? 1 : -1) * Math.sin(a) * speed
+      vy = Math.cos(a) * speed
+    }
+    powerUp = { spawnMs: nowMs, kind, x, y, vx, vy }
   }
 
   // Stage 2: the charged owner has just struck `b`. Make it phase through the opponent paddle
@@ -896,10 +928,19 @@ export function createAirHockey(
         clearPowerUp() // faded away uncollected
         return
       }
+      // float around the neutral zone, bouncing off its bounds (the blue lines + the rink edges)
+      const z = neutralZone()
+      powerUp.x += powerUp.vx
+      powerUp.y += powerUp.vy
+      if (powerUp.x < z.minX) (powerUp.x = z.minX), (powerUp.vx = Math.abs(powerUp.vx))
+      else if (powerUp.x > z.maxX) (powerUp.x = z.maxX), (powerUp.vx = -Math.abs(powerUp.vx))
+      if (powerUp.y < z.minY) (powerUp.y = z.minY), (powerUp.vy = Math.abs(powerUp.vy))
+      else if (powerUp.y > z.maxY) (powerUp.y = z.maxY), (powerUp.vy = -Math.abs(powerUp.vy))
+
       const reach = geo.paddleR + powerUpRadius()
       for (let i = 0; i < paddles.length; i++) {
         const p = paddles[i]
-        if (Math.hypot(p.position.x - geo.cx, p.position.y - geo.cy) < reach) {
+        if (Math.hypot(p.position.x - powerUp.x, p.position.y - powerUp.y) < reach) {
           if (powerUp.kind === 'two-pucks') spawnExtraPuck()
           else charge = { owner: i as 0 | 1, sinceMs: nowMs } // arm this paddle for an invincible strike
           clearPowerUp()
@@ -1080,12 +1121,13 @@ export function createAirHockey(
     if (body === invincible?.puck) drawAmberFlash(body.position.x, body.position.y, geo.puckR * 1.6)
   }
 
-  // The power-up at center: a steady glow ring plus the kind's badge with a gentle pulse.
+  // The drifting power-up badge: a steady glow ring plus the kind's badge with a gentle pulse,
+  // drawn at its current floating position in the neutral zone.
   function drawPowerUp() {
     const sprite = powerUp?.kind === 'invincibility' ? invincibleSprite : powerUpSprite
     if (!powerUp || !sprite) return
     const c = ctx!
-    const { cx, cy } = geo
+    const { x, y } = powerUp
     const t = (nowMs - powerUp.spawnMs) / 1000
     const pulse = 1 + Math.sin(t * 4) * 0.08 // gentle breathing scale
     const r = powerUpRadius()
@@ -1093,7 +1135,7 @@ export function createAirHockey(
     // live glow ring so it reads as "grab me", independent of the baked sprite shadow
     c.save()
     c.beginPath()
-    c.arc(cx, cy, r * (1.25 + Math.sin(t * 4) * 0.1), 0, Math.PI * 2)
+    c.arc(x, y, r * (1.25 + Math.sin(t * 4) * 0.1), 0, Math.PI * 2)
     c.strokeStyle = 'rgba(247,180,53,0.55)'
     c.lineWidth = r * 0.12
     c.stroke()
@@ -1101,7 +1143,7 @@ export function createAirHockey(
 
     const size = sprite.size * pulse
     const half = size / 2
-    c.drawImage(sprite.canvas, cx - half, cy - half, size, size)
+    c.drawImage(sprite.canvas, x - half, y - half, size, size)
   }
 
   function drawPaddle(i: number) {
