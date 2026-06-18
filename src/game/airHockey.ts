@@ -123,6 +123,13 @@ export function createAirHockey(
   engine.gravity.y = 0
 
   let iceTexture: HTMLCanvasElement | null = null // cached scratchy-ice scuffs (rebuilt on resize)
+  // Nothing in the rink moves, so the whole static composite (bg + ice + markings + creases +
+  // scuffs + logo) is baked once per size and blitted each frame. The puck/paddle are pre-rendered
+  // to sprites so their gradients + shadow-blur are computed once, not 3× per frame. All rebuilt
+  // on resize via computeGeo().
+  let staticLayer: HTMLCanvasElement | null = null
+  let puckSprite: { canvas: HTMLCanvasElement; size: number } | null = null
+  const paddleSprites: ({ canvas: HTMLCanvasElement; size: number } | null)[] = [null, null]
   let geo: Geo = computeGeo()
   let puck: Matter.Body
   let paddles: Matter.Body[] = []
@@ -210,6 +217,103 @@ export function createAirHockey(
       tc.stroke()
     }
     return t
+  }
+
+  // Bake the entire static rink (black background, ice gradient, painted markings, creases,
+  // scuff texture, logo) into one offscreen canvas, rebuilt only on resize. draw() then blits
+  // this once per frame instead of re-running the whole sequence every frame. The offscreen
+  // canvas matches the backing store (W·dpr × H·dpr) and is scaled to logical coords so the
+  // existing draw helpers work unchanged. Note: the scoreboard is NOT baked (its digits change
+  // and pulse), so it now paints over the scuffs rather than under — imperceptible at 0.05 alpha.
+  function buildStaticLayer(): HTMLCanvasElement | null {
+    const { W, H, left, top, pw, ph, cornerR, portrait } = geo
+    const dpr = window.devicePixelRatio || 1
+    const s = document.createElement('canvas')
+    s.width = Math.max(1, Math.round(W * dpr))
+    s.height = Math.max(1, Math.round(H * dpr))
+    const sc = s.getContext('2d')
+    if (!sc) return null
+    sc.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+    // everything outside the rink is black
+    sc.fillStyle = OUTSIDE
+    sc.fillRect(0, 0, W, H)
+
+    // faintly-blue ice: subtle gradient, bluer at the edges, lighter toward the middle
+    roundRectPath(sc, left, top, pw, ph, cornerR)
+    const iceGrad = portrait
+      ? sc.createLinearGradient(0, top, 0, top + ph)
+      : sc.createLinearGradient(left, 0, left + pw, 0)
+    iceGrad.addColorStop(0, ICE_EDGE)
+    iceGrad.addColorStop(0.5, ICE_MID)
+    iceGrad.addColorStop(1, ICE_EDGE)
+    sc.fillStyle = iceGrad
+    sc.fill()
+
+    // markings + creases + scuffs + logo, clipped to the ice. Paint goes down first so the
+    // scratchy scuffs ride OVER it — like real ice paint worn by skates.
+    sc.save()
+    roundRectPath(sc, left, top, pw, ph, cornerR)
+    sc.clip()
+    drawMarkings(sc)
+    drawGoals(sc)
+    if (iceTexture) sc.drawImage(iceTexture, left, top, pw, ph)
+    drawLogo(sc)
+    sc.restore()
+    return s
+  }
+
+  // Pre-render a circular sprite (gradient/fill + soft drop shadow) once per size. The shadow
+  // has no offset, only blur, so the sprite canvas is padded by the blur radius on every side
+  // and the circle is drawn at its center. Built at device pixels for crispness; draw() blits
+  // it scaled to its logical `size`, centered on the body position.
+  function buildSprite(
+    r: number,
+    blur: number,
+    paint: (sc: CanvasRenderingContext2D, cx: number, cy: number, r: number) => void,
+  ): { canvas: HTMLCanvasElement; size: number } | null {
+    const dpr = window.devicePixelRatio || 1
+    const pad = blur + r * 0.15 // blur radius + a hair of slack so the shadow isn't clipped
+    const size = (r + pad) * 2 // logical sprite dimension
+    const cv = document.createElement('canvas')
+    cv.width = Math.max(1, Math.round(size * dpr))
+    cv.height = Math.max(1, Math.round(size * dpr))
+    const sc = cv.getContext('2d')
+    if (!sc) return null
+    sc.setTransform(dpr, 0, 0, dpr, 0, 0)
+    paint(sc, size / 2, size / 2, r)
+    return { canvas: cv, size }
+  }
+
+  function buildSprites() {
+    const { puckR, paddleR } = geo
+    puckSprite = buildSprite(puckR, puckR * 0.6, (sc, cx, cy, r) => {
+      sc.beginPath()
+      sc.arc(cx, cy, r, 0, Math.PI * 2)
+      sc.fillStyle = PUCK_COLOR
+      sc.shadowColor = 'rgba(0,0,0,0.35)'
+      sc.shadowBlur = r * 0.6
+      sc.fill()
+    })
+    for (const i of [0, 1] as const) {
+      const color = i === 0 ? RED : BLUE
+      paddleSprites[i] = buildSprite(paddleR, paddleR * 0.4, (sc, cx, cy, r) => {
+        sc.beginPath()
+        sc.arc(cx, cy, r, 0, Math.PI * 2)
+        const grad = sc.createRadialGradient(cx, cy, r * 0.2, cx, cy, r)
+        grad.addColorStop(0, '#ffffff')
+        grad.addColorStop(0.4, color)
+        grad.addColorStop(1, color)
+        sc.fillStyle = grad
+        sc.shadowColor = 'rgba(0,0,0,0.35)'
+        sc.shadowBlur = r * 0.4
+        sc.fill()
+        sc.beginPath()
+        sc.arc(cx, cy, r * 0.42, 0, Math.PI * 2)
+        sc.fillStyle = color
+        sc.fill()
+      })
+    }
   }
 
   function homePos(i: number): Matter.Vector {
@@ -518,42 +622,27 @@ export function createAirHockey(
   }
 
   // ── rendering ────────────────────────────────────────────────────────────────
+  // Rebuild the cached static rink + puck/paddle sprites for the current geometry. Called at
+  // startup and on every resize (kept out of computeGeo to avoid touching `geo` before it's
+  // initialized on the first call).
+  function rebuildStatics() {
+    staticLayer = buildStaticLayer()
+    buildSprites()
+  }
+
   function draw() {
     const c = ctx!
-    const { W, H, left, top, pw, ph, cornerR } = geo
+    const { W, H } = geo
 
-    // everything outside the rink is black
-    c.fillStyle = OUTSIDE
-    c.fillRect(0, 0, W, H)
+    // The entire static rink (background, ice, markings, creases, scuffs, logo) is pre-baked;
+    // blit it in one shot, then layer the only things that actually move on top.
+    if (staticLayer) c.drawImage(staticLayer, 0, 0, W, H)
+    else c.clearRect(0, 0, W, H)
 
-    // faintly-blue ice with rounded corners — subtle gradient: bluer at the edges, lighter
-    // toward the middle, for a touch of depth
-    roundRectPath(c, left, top, pw, ph, cornerR)
-    const iceGrad = geo.portrait
-      ? c.createLinearGradient(0, top, 0, top + ph)
-      : c.createLinearGradient(left, 0, left + pw, 0)
-    iceGrad.addColorStop(0, ICE_EDGE)
-    iceGrad.addColorStop(0.5, ICE_MID)
-    iceGrad.addColorStop(1, ICE_EDGE)
-    c.fillStyle = iceGrad
-    c.fill()
-
-    // markings + score + texture + goals + logo clipped to the ice
-    c.save()
-    roundRectPath(c, left, top, pw, ph, cornerR)
-    c.clip()
-    // Paint goes down first (rink lines + score numbers) so the scratchy scuffs ride
-    // OVER it — like real ice paint worn by skates, not lines floating on the scuffs.
-    drawMarkings()
-    drawScoreboard()
-    drawGoals() // crease paint
-    if (iceTexture) c.drawImage(iceTexture, left, top, pw, ph) // skate scuffs over the paint
-    drawLogo()
-    c.restore()
-
+    drawScoreboard() // per-frame: digits change + brief scale-pop on a goal
     drawPuck()
-    drawPaddle(0, RED)
-    drawPaddle(1, BLUE)
+    drawPaddle(0)
+    drawPaddle(1)
 
     if (phase === 'countdown') drawCountdown()
     else if (phase === 'celebrating') {
@@ -562,8 +651,7 @@ export function createAirHockey(
     } else if (phase === 'gameover') drawWinner()
   }
 
-  function drawMarkings() {
-    const c = ctx!
+  function drawMarkings(c: CanvasRenderingContext2D) {
     const { left, right, top, bottom, cx, cy, pw, ph, rBase, portrait } = geo
     const lw = Math.max(2, rBase * 0.01)
     const ringR = rBase * 0.16 // center face-off ring radius (red center line stops here)
@@ -620,21 +708,28 @@ export function createAirHockey(
   // box we paint a hockey "crease" — a faded half-circle on the ice in front of each
   // net, bulging inward from the goal line. Purely cosmetic (scoring/bounce geometry is
   // unchanged); painted under the ice texture like the rink lines.
-  function drawGoals() {
+  function drawGoals(c: CanvasRenderingContext2D) {
     const { left, right, top, bottom, cx, cy, goalLen } = geo
     const r = goalLen / 2 // crease spans the goal mouth
     const HALF = Math.PI / 2
     if (!geo.portrait) {
-      paintCrease(left, cy, r, RED_LINE_WASH, -HALF, HALF) // opens right, into the ice
-      paintCrease(right, cy, r, BLUE_LINE_WASH, HALF, 3 * HALF) // opens left
+      paintCrease(c, left, cy, r, RED_LINE_WASH, -HALF, HALF) // opens right, into the ice
+      paintCrease(c, right, cy, r, BLUE_LINE_WASH, HALF, 3 * HALF) // opens left
     } else {
-      paintCrease(cx, bottom, r, RED_LINE_WASH, Math.PI, 2 * Math.PI) // opens up
-      paintCrease(cx, top, r, BLUE_LINE_WASH, 0, Math.PI) // opens down
+      paintCrease(c, cx, bottom, r, RED_LINE_WASH, Math.PI, 2 * Math.PI) // opens up
+      paintCrease(c, cx, top, r, BLUE_LINE_WASH, 0, Math.PI) // opens down
     }
   }
 
-  function paintCrease(x: number, y: number, r: number, color: string, a0: number, a1: number) {
-    const c = ctx!
+  function paintCrease(
+    c: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    r: number,
+    color: string,
+    a0: number,
+    a1: number,
+  ) {
     c.save()
     // faded ice tint inside the crease
     c.globalAlpha = 0.32
@@ -653,9 +748,8 @@ export function createAirHockey(
     c.restore()
   }
 
-  function drawLogo() {
+  function drawLogo(c: CanvasRenderingContext2D) {
     if (!(logo.complete && logo.naturalWidth > 0)) return
-    const c = ctx!
     const size = geo.rBase * 0.27
     c.save()
     c.globalAlpha = 0.5 // washed out — faded into the ice
@@ -663,38 +757,20 @@ export function createAirHockey(
     c.restore()
   }
 
+  // Puck and paddles blit their pre-rendered sprites (gradient + shadow baked once per size)
+  // centered on the body position — no per-frame gradient/shadow-blur.
   function drawPuck() {
-    const c = ctx!
-    c.save()
-    c.beginPath()
-    c.arc(puck.position.x, puck.position.y, geo.puckR, 0, Math.PI * 2)
-    c.fillStyle = PUCK_COLOR
-    c.shadowColor = 'rgba(0,0,0,0.35)'
-    c.shadowBlur = geo.puckR * 0.6
-    c.fill()
-    c.restore()
+    if (!puckSprite) return
+    const half = puckSprite.size / 2
+    ctx!.drawImage(puckSprite.canvas, puck.position.x - half, puck.position.y - half, puckSprite.size, puckSprite.size)
   }
 
-  function drawPaddle(i: number, color: string) {
-    const c = ctx!
+  function drawPaddle(i: number) {
+    const sp = paddleSprites[i]
+    if (!sp) return
     const p = paddles[i]
-    const r = geo.paddleR
-    c.save()
-    c.beginPath()
-    c.arc(p.position.x, p.position.y, r, 0, Math.PI * 2)
-    const grad = c.createRadialGradient(p.position.x, p.position.y, r * 0.2, p.position.x, p.position.y, r)
-    grad.addColorStop(0, '#ffffff')
-    grad.addColorStop(0.4, color)
-    grad.addColorStop(1, color)
-    c.fillStyle = grad
-    c.shadowColor = 'rgba(0,0,0,0.35)'
-    c.shadowBlur = r * 0.4
-    c.fill()
-    c.beginPath()
-    c.arc(p.position.x, p.position.y, r * 0.42, 0, Math.PI * 2)
-    c.fillStyle = color
-    c.fill()
-    c.restore()
+    const half = sp.size / 2
+    ctx!.drawImage(sp.canvas, p.position.x - half, p.position.y - half, sp.size, sp.size)
   }
 
   // ── double-sided overlays (readable from both ends) ──────────────────────────
@@ -959,12 +1035,22 @@ export function createAirHockey(
   }
 
   // ── main loop ─────────────────────────────────────────────────────────────────
+  const IDLE_FRAME_MS = 1000 / 15 // throttle target while the game-over screen sits idle
+  const WIN_BANNER_SETTLE_MS = 450 // winner headline entrance length (see drawWinner) — after
+  //                                  this only the slow "tap to play" prompt pulse remains
   let raf = 0
   let last = performance.now()
   let acc = 0
+  let lastWork = 0
   function frame(now: number) {
     raf = requestAnimationFrame(frame)
     nowMs = now
+    // Idle on the game-over screen: once the winner banner has settled, nothing moves but the
+    // slow prompt pulse, so drop to ~15fps to cut power/heat. A tap still resets instantly
+    // (handled in onDown, independent of this loop). rAF is already re-scheduled above.
+    const idle = phase === 'gameover' && now - winStartMs > WIN_BANNER_SETTLE_MS
+    if (idle && now - lastWork < IDLE_FRAME_MS) return
+    lastWork = now
     let dt = now - last
     last = now
     if (dt > 100) dt = 100 // clamp after tab/visibility stalls
@@ -981,6 +1067,7 @@ export function createAirHockey(
 
   // ── bootstrap ─────────────────────────────────────────────────────────────────
   buildWorld()
+  rebuildStatics()
   reset()
   canvas.addEventListener('pointerdown', onDown)
   canvas.addEventListener('pointermove', onMove)
@@ -995,6 +1082,7 @@ export function createAirHockey(
       // re-seats the puck at the current face-off spot; gameover parks it at center.
       geo = computeGeo()
       buildWorld()
+      rebuildStatics() // re-bake rink + sprites for the new dimensions/orientation
       if (phase === 'gameover') {
         Body.setPosition(puck, { x: geo.cx, y: geo.cy })
         Body.setVelocity(puck, { x: 0, y: 0 })
