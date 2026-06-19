@@ -34,6 +34,16 @@ const MAX_EXTRA_PUCKS = 2 // safety cap so the repeating "two pucks" power-up ca
 const INVINCIBLE_SPEED_MULT = 1.7 // an invincible puck moves this much faster than the normal cap
 const INVINCIBLE_MS = 2000 // how long an invincible-puck run lasts before reverting to normal
 const BRICK_SHATTER_MS = 260 // a struck brick's shatter flash lingers this long, then is dropped
+const BIG_PADDLE_MS = 5000 // how long a "big paddle" run lasts before the paddle reverts to normal
+const BIG_PADDLE_SCALE = 2 // a "big paddle" is this many times its normal radius
+const MAX_EXTRA_PADDLES = 1 // a player can hold at most this many "double paddle" extras at once
+// shared physics body options for every paddle (base + "double paddle" extras) so they behave alike
+const PADDLE_OPTS = {
+  restitution: 0.4,
+  friction: 0,
+  frictionAir: 0.2,
+  density: 0.05, // heavy vs. puck so it barely recoils
+}
 
 // Team / rink palette
 const RED = '#e23b3b' // Player 1
@@ -50,7 +60,7 @@ const TOS_YELLOW = '#F7B435' // TelemetryOS brand yellow — the READY headline
 type Phase = 'celebrating' | 'countdown' | 'playing' | 'gameover' | 'ready'
 
 // which random power-up a center badge grants when collected
-type PowerKind = 'two-pucks' | 'invincibility' | 'brick'
+type PowerKind = 'two-pucks' | 'invincibility' | 'brick' | 'double-paddle' | 'big-paddle'
 
 // one of the five curved bricks arched over an owner's crease (brick-breaker shield).
 // `body` is a static rectangle (chord of the arc segment) for physics; the arc fields
@@ -120,6 +130,10 @@ export interface AirHockeyController {
   debugGoal(team: 0 | 1): void
   /** Dev/test helper: raise a team's brick-shield wall (the "brick" power-up effect). */
   debugBricks(team: 0 | 1): void
+  /** Dev/test helper: give a team a second paddle (the "double paddle" power-up effect). */
+  debugDoublePaddle(team: 0 | 1): void
+  /** Dev/test helper: double a team's paddle for 5s (the "big paddle" power-up effect). */
+  debugBigPaddle(team: 0 | 1): void
 }
 
 const clamp = (v: number, min: number, max: number) => (v < min ? min : v > max ? max : v)
@@ -161,11 +175,17 @@ export function createAirHockey(
   let powerUpSprite: { canvas: HTMLCanvasElement; size: number } | null = null // "two pucks" badge
   let invincibleSprite: { canvas: HTMLCanvasElement; size: number } | null = null // invincibility badge
   let bricksSprite: { canvas: HTMLCanvasElement; size: number } | null = null // "brick wall" badge
+  let doublePaddleSprite: { canvas: HTMLCanvasElement; size: number } | null = null // "double paddle" badge
+  let bigPaddleSprite: { canvas: HTMLCanvasElement; size: number } | null = null // "big paddle" badge
   const paddleSprites: ({ canvas: HTMLCanvasElement; size: number } | null)[] = [null, null]
   let geo: Geo = computeGeo()
   let puck: Matter.Body
   const extraPucks: Matter.Body[] = [] // transient pucks spawned by the "two pucks" power-up
-  let paddles: Matter.Body[] = []
+  let paddles: Matter.Body[] = [] // the two base paddles; index === owning player
+  // transient second paddles spawned by the "double paddle" power-up (one per player at most)
+  const extraPaddles: { owner: 0 | 1; body: Matter.Body }[] = []
+  const paddleOwner = new Map<Matter.Body, 0 | 1>() // every paddle body → the player who controls it
+  const bigUntil = new Map<Matter.Body, number>() // a "big paddle" body → wall-clock ms it reverts at
 
   const scores: [number, number] = [0, 0]
   let phase: Phase = 'countdown'
@@ -195,9 +215,10 @@ export function createAirHockey(
   let readyStartMs = 0 // when the READY lobby began (entrance anim)
   const scorePulseAt: [number, number] = [-1e9, -1e9] // per-team scoreboard pop timestamps
 
-  // paddle finger targets (null = released); one pointer owns one paddle
-  const targets: (Matter.Vector | null)[] = [null, null]
-  const pointerOwner = new Map<number, number>()
+  // paddle finger targets, keyed by paddle body (absent/null = released). A pointer owns one
+  // paddle body, so a player with a "double paddle" extra can drive both with two fingers.
+  const targets = new Map<Matter.Body, Matter.Vector | null>()
+  const pointerOwner = new Map<number, Matter.Body>()
   // hidden hold-to-reset hot zones in the dark corners; one pointer per corner press
   const cornerHolds = new Map<number, { corner: number; startMs: number }>()
 
@@ -423,6 +444,65 @@ export function createAirHockey(
         }
       }
     })
+    // "double paddle" power-up: the amber disc stamped with two overlapping mini-paddle rings
+    doublePaddleSprite = buildSprite(powerUpRadius(), powerUpRadius() * 0.7, (sc, cx, cy, r) => {
+      const grad = sc.createRadialGradient(cx, cy, r * 0.1, cx, cy, r)
+      grad.addColorStop(0, '#ffe9b0')
+      grad.addColorStop(0.6, TOS_YELLOW)
+      grad.addColorStop(1, '#d8930f')
+      sc.beginPath()
+      sc.arc(cx, cy, r, 0, Math.PI * 2)
+      sc.fillStyle = grad
+      sc.shadowColor = 'rgba(247,180,53,0.85)'
+      sc.shadowBlur = r * 0.8
+      sc.fill()
+      sc.shadowBlur = 0
+      const pr = r * 0.4 // mini-paddle radius
+      for (const [sx, sy] of [[-0.26, 0.2], [0.26, -0.2]] as const) {
+        const px = cx + sx * r
+        const py = cy + sy * r
+        sc.beginPath()
+        sc.arc(px, py, pr, 0, Math.PI * 2)
+        sc.fillStyle = PUCK_COLOR
+        sc.fill()
+        sc.beginPath()
+        sc.arc(px, py, pr * 0.42, 0, Math.PI * 2) // hub punched out to the amber face
+        sc.fillStyle = '#ffe9b0'
+        sc.fill()
+      }
+    })
+    // "big paddle" power-up: the amber disc stamped with a mini-paddle and four outward "grow" arrows
+    bigPaddleSprite = buildSprite(powerUpRadius(), powerUpRadius() * 0.7, (sc, cx, cy, r) => {
+      const grad = sc.createRadialGradient(cx, cy, r * 0.1, cx, cy, r)
+      grad.addColorStop(0, '#ffe9b0')
+      grad.addColorStop(0.6, TOS_YELLOW)
+      grad.addColorStop(1, '#d8930f')
+      sc.beginPath()
+      sc.arc(cx, cy, r, 0, Math.PI * 2)
+      sc.fillStyle = grad
+      sc.shadowColor = 'rgba(247,180,53,0.85)'
+      sc.shadowBlur = r * 0.8
+      sc.fill()
+      sc.shadowBlur = 0
+      sc.fillStyle = PUCK_COLOR
+      const pr = r * 0.28 // central mini-paddle
+      sc.beginPath()
+      sc.arc(cx, cy, pr, 0, Math.PI * 2)
+      sc.fill()
+      sc.beginPath()
+      sc.arc(cx, cy, pr * 0.42, 0, Math.PI * 2)
+      sc.fillStyle = '#ffe9b0'
+      sc.fill()
+      sc.fillStyle = PUCK_COLOR
+      for (const a of [Math.PI / 4, (3 * Math.PI) / 4, (5 * Math.PI) / 4, (7 * Math.PI) / 4]) {
+        sc.beginPath()
+        sc.moveTo(cx + Math.cos(a) * r * 0.86, cy + Math.sin(a) * r * 0.86) // arrow tip
+        sc.lineTo(cx + Math.cos(a + 0.34) * r * 0.56, cy + Math.sin(a + 0.34) * r * 0.56)
+        sc.lineTo(cx + Math.cos(a - 0.34) * r * 0.56, cy + Math.sin(a - 0.34) * r * 0.56)
+        sc.closePath()
+        sc.fill()
+      }
+    })
     for (const i of [0, 1] as const) {
       const color = i === 0 ? RED : BLUE
       paddleSprites[i] = buildSprite(paddleR, paddleR * 0.4, (sc, cx, cy, r) => {
@@ -464,17 +544,28 @@ export function createAirHockey(
     return centerFaceoff ? { x: geo.cx, y: geo.cy } : faceoffPoint(serveToward)
   }
 
-  // restrict paddle i to its half (kept paddleR away from edges & center line)
-  function clampToHalf(i: number, x: number, y: number): Matter.Vector {
-    const { left, right, top, bottom, cx, cy, portrait, paddleR: r, cornerR } = geo
+  // every live paddle (the two base paddles plus any "double paddle" extras), tagged with owner
+  function allPaddles(): { owner: 0 | 1; body: Matter.Body }[] {
+    return [{ owner: 0, body: paddles[0] }, { owner: 1, body: paddles[1] }, ...extraPaddles]
+  }
+
+  // a paddle body's current radius — doubled while a "big paddle" run is active, else normal
+  function effectivePaddleR(body: Matter.Body): number {
+    const until = bigUntil.get(body)
+    return until && until > nowMs ? geo.paddleR * BIG_PADDLE_SCALE : geo.paddleR
+  }
+
+  // restrict an owner's paddle to its half (kept radius r away from edges & center line)
+  function clampToHalf(owner: number, x: number, y: number, r: number = geo.paddleR): Matter.Vector {
+    const { left, right, top, bottom, cx, cy, portrait, cornerR } = geo
     let nx = x
     let ny = y
     if (!portrait) {
       ny = clamp(ny, top + r, bottom - r)
-      nx = i === 0 ? clamp(nx, left + r, cx - r) : clamp(nx, cx + r, right - r)
+      nx = owner === 0 ? clamp(nx, left + r, cx - r) : clamp(nx, cx + r, right - r)
     } else {
       nx = clamp(nx, left + r, right - r)
-      ny = i === 0 ? clamp(ny, cy + r, bottom - r) : clamp(ny, top + r, cy - r)
+      ny = owner === 0 ? clamp(ny, cy + r, bottom - r) : clamp(ny, top + r, cy - r)
     }
     // keep the paddle off the rounded corners (radial clamp to the ice arc)
     const corners: [number, number, number, number][] = [
@@ -603,15 +694,17 @@ export function createAirHockey(
     const fo = faceoffSpot()
     puck = makePuck(fo.x, fo.y)
 
-    paddles = [0, 1].map((i) =>
-      Bodies.circle(homePos(i).x, homePos(i).y, geo.paddleR, {
-        restitution: 0.4,
-        friction: 0,
-        frictionAir: 0.2,
-        density: 0.05, // heavy vs. puck so it barely recoils
-      }),
-    )
+    paddles = [0, 1].map((i) => Bodies.circle(homePos(i).x, homePos(i).y, geo.paddleR, PADDLE_OPTS))
     Composite.add(engine.world, paddles)
+    // a rebuild (resize) wiped every paddle, including "double paddle" extras and any "big paddle"
+    // scaling — drop their stale references and re-tag the two fresh base paddles by owner.
+    extraPaddles.length = 0
+    bigUntil.clear()
+    paddleOwner.clear()
+    targets.clear()
+    pointerOwner.clear()
+    paddleOwner.set(paddles[0], 0)
+    paddleOwner.set(paddles[1], 1)
   }
 
   // ── pucks & power-ups ─────────────────────────────────────────────────────────
@@ -657,6 +750,41 @@ export function createAirHockey(
     extraPucks.length = 0
   }
 
+  // "Double paddle" power-up: give an owner a second, normal-size paddle they can drive with a
+  // second finger. It sits still beside their home spot until grabbed, and lasts until a face-off.
+  function spawnExtraPaddle(owner: 0 | 1) {
+    if (extraPaddles.filter((p) => p.owner === owner).length >= MAX_EXTRA_PADDLES) return
+    const home = homePos(owner)
+    const off = geo.paddleR * 4 // sit clear of the base paddle, along the goal line
+    const raw = geo.portrait ? { x: home.x + off, y: home.y } : { x: home.x, y: home.y + off }
+    const pos = clampToHalf(owner, raw.x, raw.y)
+    const body = Bodies.circle(pos.x, pos.y, geo.paddleR, PADDLE_OPTS)
+    Composite.add(engine.world, body)
+    extraPaddles.push({ owner, body })
+    paddleOwner.set(body, owner)
+  }
+
+  function clearExtraPaddles() {
+    for (const { body } of extraPaddles) {
+      Composite.remove(engine.world, body)
+      paddleOwner.delete(body)
+      bigUntil.delete(body)
+      targets.delete(body)
+      for (const [id, b] of pointerOwner) if (b === body) pointerOwner.delete(id) // free its finger
+    }
+    extraPaddles.length = 0
+  }
+
+  // revert any "big paddle" base paddle to normal size (extras are destroyed by clearExtraPaddles)
+  function resetPaddleSizes() {
+    for (const body of paddles) {
+      if (bigUntil.has(body)) {
+        Body.scale(body, 1 / BIG_PADDLE_SCALE, 1 / BIG_PADDLE_SCALE)
+        bigUntil.delete(body)
+      }
+    }
+  }
+
   function powerUpRadius() {
     return geo.puckR * 1.6
   }
@@ -676,7 +804,7 @@ export function createAirHockey(
   // Choose a power-up kind uniformly (two-pucks falls back to another kind when extras are maxed),
   // then send it drifting in from a rink edge within the neutral zone at a gentle inward angle.
   function spawnPowerUp() {
-    const kinds: PowerKind[] = ['two-pucks', 'invincibility', 'brick']
+    const kinds: PowerKind[] = ['two-pucks', 'invincibility', 'brick', 'double-paddle', 'big-paddle']
     let kind = kinds[Math.floor(Math.random() * kinds.length)]
     // two-pucks falls back to one of the other always-available kinds when extras are maxed
     if (kind === 'two-pucks' && extraPucks.length >= MAX_EXTRA_PUCKS) kind = Math.random() < 0.5 ? 'invincibility' : 'brick'
@@ -702,33 +830,41 @@ export function createAirHockey(
     powerUp = { spawnMs: nowMs, kind, x, y, vx, vy }
   }
 
-  // Stage 2: the charged owner has just struck `b`. Make it phase through the opponent paddle
-  // (a shared negative collisionFilter.group disables that one pair while leaving walls + the
-  // owner's paddle solid) and shove it off at the invincible speed in its post-hit direction.
+  // Stage 2: the charged owner has just struck `b`. Make it phase through every opponent paddle
+  // (a shared negative collisionFilter.group disables those pairs while leaving walls + the
+  // owner's own paddles solid) and shove it off at the invincible speed in its post-hit direction.
   // The run lasts INVINCIBLE_MS (it bounces off walls during that window) then reverts to normal.
   function launchInvincible(b: Matter.Body, owner: 0 | 1) {
     invincible = { puck: b, owner, sinceMs: nowMs }
     b.collisionFilter.group = -1
-    paddles[1 - owner].collisionFilter.group = -1
+    for (const p of allPaddles()) if (p.owner !== owner) p.body.collisionFilter.group = -1
     const fast = geo.rBase * 0.03 * INVINCIBLE_SPEED_MULT
     let dx = b.velocity.x
     let dy = b.velocity.y
     let mag = Math.hypot(dx, dy)
     if (mag < 1e-3) {
-      // degenerate (barely moving): shoot away from the striking paddle
-      dx = b.position.x - paddles[owner].position.x
-      dy = b.position.y - paddles[owner].position.y
+      // degenerate (barely moving): shoot away from the owner's nearest paddle
+      const own = allPaddles()
+        .filter((p) => p.owner === owner)
+        .reduce((a, p) =>
+          Math.hypot(p.body.position.x - b.position.x, p.body.position.y - b.position.y) <
+          Math.hypot(a.body.position.x - b.position.x, a.body.position.y - b.position.y)
+            ? p
+            : a,
+        )
+      dx = b.position.x - own.body.position.x
+      dy = b.position.y - own.body.position.y
       mag = Math.hypot(dx, dy) || 1
     }
     Body.setVelocity(b, { x: (dx / mag) * fast, y: (dy / mag) * fast })
     charge = null
   }
 
-  // End an invincible-puck run: restore normal collision (puck ↔ opponent paddle) and speed cap.
+  // End an invincible-puck run: restore normal collision (puck ↔ opponent paddles) and speed cap.
   function endInvincible() {
     if (!invincible) return
     invincible.puck.collisionFilter.group = 0
-    paddles[1 - invincible.owner].collisionFilter.group = 0
+    for (const p of allPaddles()) if (p.owner !== invincible.owner) p.body.collisionFilter.group = 0
     invincible = null
   }
 
@@ -827,6 +963,8 @@ export function createAirHockey(
     clearPowerUp()
     clearBricks()
     endInvincible()
+    clearExtraPaddles()
+    resetPaddleSizes()
     charge = null
     serveToward = toward
     centerFaceoff = center
@@ -845,6 +983,8 @@ export function createAirHockey(
     clearPowerUp()
     clearBricks()
     endInvincible()
+    clearExtraPaddles()
+    resetPaddleSizes()
     charge = null
     scores[scorer]++
     scorePulseAt[scorer] = nowMs // pop the scoreboard digit
@@ -945,6 +1085,10 @@ export function createAirHockey(
     clearExtraPucks()
     clearPowerUp()
     clearBricks()
+    endInvincible()
+    clearExtraPaddles()
+    resetPaddleSizes()
+    charge = null
     scores[0] = 0
     scores[1] = 0
     winner = -1
@@ -952,8 +1096,8 @@ export function createAirHockey(
       Body.setPosition(p, homePos(i))
       Body.setVelocity(p, { x: 0, y: 0 })
     })
-    targets[0] = null
-    targets[1] = null
+    targets.clear()
+    pointerOwner.clear()
     scoreFlash = null
   }
 
@@ -1000,9 +1144,8 @@ export function createAirHockey(
     puck.isSensor = phase !== 'playing'
 
     // velocity-chase paddles toward fingers
-    for (let i = 0; i < 2; i++) {
-      const p = paddles[i]
-      const tgt = targets[i]
+    for (const { body: p } of allPaddles()) {
+      const tgt = targets.get(p)
       if (tgt && (phase === 'playing' || phase === 'countdown')) {
         let vx = (tgt.x - p.position.x) * 0.85
         let vy = (tgt.y - p.position.y) * 0.85
@@ -1037,21 +1180,32 @@ export function createAirHockey(
       if (bricks[k].broken && nowMs - bricks[k].brokenMs > BRICK_SHATTER_MS) bricks.splice(k, 1)
     }
 
-    // keep paddles inside their halves even after puck impacts
-    for (let i = 0; i < 2; i++) {
-      const p = paddles[i]
-      const c = clampToHalf(i, p.position.x, p.position.y)
+    // keep paddles inside their halves even after puck impacts (a "big paddle" needs more room)
+    for (const { owner, body: p } of allPaddles()) {
+      const c = clampToHalf(owner, p.position.x, p.position.y, effectivePaddleR(p))
       if (c.x !== p.position.x || c.y !== p.position.y) Body.setPosition(p, c)
     }
 
+    // revert any "big paddle" whose 5s run has elapsed, scaling its body back to normal
+    for (const [body, until] of bigUntil) {
+      if (nowMs >= until) {
+        Body.scale(body, 1 / BIG_PADDLE_SCALE, 1 / BIG_PADDLE_SCALE)
+        bigUntil.delete(body)
+      }
+    }
+
     // invincibility stage 1→2: a charged paddle that touches a puck launches it as the invincible
-    // puck — fast, phasing through the opponent — until it strikes a wall or scores.
+    // puck — fast, phasing through the opponent — until it strikes a wall or scores. Any of the
+    // charged owner's paddles (base, big, or "double paddle" extra) can land the strike.
     if (charge && phase === 'playing') {
-      const op = paddles[charge.owner]
-      const contact = geo.paddleR + geo.puckR * 1.3
-      for (const b of [puck, ...extraPucks]) {
-        if (Math.hypot(op.position.x - b.position.x, op.position.y - b.position.y) < contact) {
-          launchInvincible(b, charge.owner)
+      for (const { owner, body: op } of allPaddles()) {
+        if (owner !== charge.owner) continue
+        const contact = effectivePaddleR(op) + geo.puckR * 1.3
+        const hit = [puck, ...extraPucks].find(
+          (b) => Math.hypot(op.position.x - b.position.x, op.position.y - b.position.y) < contact,
+        )
+        if (hit) {
+          launchInvincible(hit, charge.owner)
           break
         }
       }
@@ -1097,13 +1251,17 @@ export function createAirHockey(
       if (powerUp.y < z.minY) (powerUp.y = z.minY), (powerUp.vy = Math.abs(powerUp.vy))
       else if (powerUp.y > z.maxY) (powerUp.y = z.maxY), (powerUp.vy = -Math.abs(powerUp.vy))
 
-      const reach = geo.paddleR + powerUpRadius()
-      for (let i = 0; i < paddles.length; i++) {
-        const p = paddles[i]
+      for (const { owner, body: p } of allPaddles()) {
+        const reach = effectivePaddleR(p) + powerUpRadius()
         if (Math.hypot(p.position.x - powerUp.x, p.position.y - powerUp.y) < reach) {
           if (powerUp.kind === 'two-pucks') spawnExtraPuck()
-          else if (powerUp.kind === 'brick') spawnBricks(i as 0 | 1) // raise this player's crease shield
-          else charge = { owner: i as 0 | 1, sinceMs: nowMs } // arm this paddle for an invincible strike
+          else if (powerUp.kind === 'brick') spawnBricks(owner) // raise this player's crease shield
+          else if (powerUp.kind === 'double-paddle') spawnExtraPaddle(owner) // give them a 2nd paddle
+          else if (powerUp.kind === 'big-paddle') {
+            // double just the paddle that grabbed it for 5s (refresh the timer if already big)
+            if (!bigUntil.has(p)) Body.scale(p, BIG_PADDLE_SCALE, BIG_PADDLE_SCALE)
+            bigUntil.set(p, nowMs + BIG_PADDLE_MS)
+          } else charge = { owner, sinceMs: nowMs } // invincibility: arm this player for a strike
           clearPowerUp()
           return
         }
@@ -1139,8 +1297,7 @@ export function createAirHockey(
     drawBricks() // crease shields, under the pucks so a striking puck renders on top
     drawPuck()
     for (const b of extraPucks) drawPuck(b)
-    drawPaddle(0)
-    drawPaddle(1)
+    for (const { owner, body } of allPaddles()) drawPaddle(owner, body)
 
     if (phase === 'countdown') drawCountdown()
     else if (phase === 'celebrating') {
@@ -1287,7 +1444,15 @@ export function createAirHockey(
   // drawn at its current floating position in the neutral zone.
   function drawPowerUp() {
     const sprite =
-      powerUp?.kind === 'invincibility' ? invincibleSprite : powerUp?.kind === 'brick' ? bricksSprite : powerUpSprite
+      powerUp?.kind === 'invincibility'
+        ? invincibleSprite
+        : powerUp?.kind === 'brick'
+          ? bricksSprite
+          : powerUp?.kind === 'double-paddle'
+            ? doublePaddleSprite
+            : powerUp?.kind === 'big-paddle'
+              ? bigPaddleSprite
+              : powerUpSprite
     if (!powerUp || !sprite) return
     const c = ctx!
     const { x, y } = powerUp
@@ -1367,13 +1532,14 @@ export function createAirHockey(
     }
   }
 
-  function drawPaddle(i: number) {
-    const sp = paddleSprites[i]
+  function drawPaddle(owner: 0 | 1, body: Matter.Body) {
+    const sp = paddleSprites[owner]
     if (!sp) return
-    const p = paddles[i]
-    const half = sp.size / 2
-    if (charge?.owner === i) drawAmberFlash(p.position.x, p.position.y, geo.paddleR * 1.2) // charged
-    ctx!.drawImage(sp.canvas, p.position.x - half, p.position.y - half, sp.size, sp.size)
+    const scale = effectivePaddleR(body) / geo.paddleR // 2× while a "big paddle" run is active
+    const size = sp.size * scale
+    const half = size / 2
+    if (charge?.owner === owner) drawAmberFlash(body.position.x, body.position.y, effectivePaddleR(body) * 1.2)
+    ctx!.drawImage(sp.canvas, body.position.x - half, body.position.y - half, size, size)
   }
 
   // ── double-sided overlays (readable from both ends) ──────────────────────────
@@ -1681,10 +1847,20 @@ export function createAirHockey(
       startGame()
       return
     }
-    const i = halfAt(pt.x, pt.y)
-    if ([...pointerOwner.values()].includes(i)) return // one finger per paddle
-    pointerOwner.set(e.pointerId, i)
-    targets[i] = clampToHalf(i, pt.x, pt.y)
+    // grab the nearest of this half's paddles that no other finger already owns (a player with a
+    // "double paddle" extra has two to choose from; one finger still owns one paddle).
+    const half = halfAt(pt.x, pt.y)
+    const held = new Set(pointerOwner.values())
+    let pick: Matter.Body | null = null
+    let best = Infinity
+    for (const { owner, body } of allPaddles()) {
+      if (owner !== half || held.has(body)) continue
+      const d = Math.hypot(body.position.x - pt.x, body.position.y - pt.y)
+      if (d < best) (best = d), (pick = body)
+    }
+    if (!pick) return // every paddle on this half is already controlled
+    pointerOwner.set(e.pointerId, pick)
+    targets.set(pick, clampToHalf(half, pt.x, pt.y, effectivePaddleR(pick)))
     try {
       canvas.setPointerCapture(e.pointerId)
     } catch {
@@ -1700,16 +1876,16 @@ export function createAirHockey(
       if (cornerAt(pt.x, pt.y) !== hold.corner) cornerHolds.delete(e.pointerId)
       return
     }
-    const i = pointerOwner.get(e.pointerId)
-    if (i === undefined) return
+    const body = pointerOwner.get(e.pointerId)
+    if (body === undefined) return
     const pt = toLocal(e)
-    targets[i] = clampToHalf(i, pt.x, pt.y)
+    targets.set(body, clampToHalf(paddleOwner.get(body)!, pt.x, pt.y, effectivePaddleR(body)))
   }
 
   function onUp(e: PointerEvent) {
     cornerHolds.delete(e.pointerId)
-    const i = pointerOwner.get(e.pointerId)
-    if (i === undefined) {
+    const body = pointerOwner.get(e.pointerId)
+    if (body === undefined) {
       try {
         canvas.releasePointerCapture(e.pointerId)
       } catch {
@@ -1718,7 +1894,7 @@ export function createAirHockey(
       return
     }
     pointerOwner.delete(e.pointerId)
-    targets[i] = null
+    targets.set(body, null)
     try {
       canvas.releasePointerCapture(e.pointerId)
     } catch {
@@ -1823,6 +1999,15 @@ export function createAirHockey(
     },
     debugBricks(team: 0 | 1) {
       spawnBricks(team)
+    },
+    debugDoublePaddle(team: 0 | 1) {
+      spawnExtraPaddle(team)
+    },
+    debugBigPaddle(team: 0 | 1) {
+      // double this team's base paddle for the usual 5s run
+      const body = paddles[team]
+      if (!bigUntil.has(body)) Body.scale(body, BIG_PADDLE_SCALE, BIG_PADDLE_SCALE)
+      bigUntil.set(body, nowMs + BIG_PADDLE_MS)
     },
   }
 }
