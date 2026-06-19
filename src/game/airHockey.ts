@@ -19,7 +19,7 @@
 
 import Matter from 'matter-js'
 
-const { Engine, Bodies, Body, Composite } = Matter
+const { Engine, Bodies, Body, Composite, Events } = Matter
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 const WIN_SCORE = 3
@@ -33,6 +33,7 @@ const POWERUP_LIFETIME_MS = 8000 // a power-up fades if no paddle grabs it in ti
 const MAX_EXTRA_PUCKS = 2 // safety cap so the repeating "two pucks" power-up can't run away
 const INVINCIBLE_SPEED_MULT = 1.7 // an invincible puck moves this much faster than the normal cap
 const INVINCIBLE_MS = 2000 // how long an invincible-puck run lasts before reverting to normal
+const BRICK_SHATTER_MS = 260 // a struck brick's shatter flash lingers this long, then is dropped
 
 // Team / rink palette
 const RED = '#e23b3b' // Player 1
@@ -49,7 +50,22 @@ const TOS_YELLOW = '#F7B435' // TelemetryOS brand yellow — the READY headline
 type Phase = 'celebrating' | 'countdown' | 'playing' | 'gameover' | 'ready'
 
 // which random power-up a center badge grants when collected
-type PowerKind = 'two-pucks' | 'invincibility'
+type PowerKind = 'two-pucks' | 'invincibility' | 'brick'
+
+// one of the five curved bricks arched over an owner's crease (brick-breaker shield).
+// `body` is a static rectangle (chord of the arc segment) for physics; the arc fields
+// (cx,cy,r,a0,a1) drive the curved render. A puck hit flags it broken for a brief shatter.
+interface Brick {
+  owner: 0 | 1
+  body: Matter.Body
+  cx: number
+  cy: number
+  r: number
+  a0: number
+  a1: number
+  broken: boolean
+  brokenMs: number
+}
 
 interface Geo {
   W: number
@@ -102,6 +118,8 @@ export interface AirHockeyController {
   debugSetScore(p1: number, p2: number): void
   /** Dev/test helper: drive a real goal through the scoring path (so it broadcasts). */
   debugGoal(team: 0 | 1): void
+  /** Dev/test helper: raise a team's brick-shield wall (the "brick" power-up effect). */
+  debugBricks(team: 0 | 1): void
 }
 
 const clamp = (v: number, min: number, max: number) => (v < min ? min : v > max ? max : v)
@@ -142,6 +160,7 @@ export function createAirHockey(
   let puckSprite: { canvas: HTMLCanvasElement; size: number } | null = null
   let powerUpSprite: { canvas: HTMLCanvasElement; size: number } | null = null // "two pucks" badge
   let invincibleSprite: { canvas: HTMLCanvasElement; size: number } | null = null // invincibility badge
+  let bricksSprite: { canvas: HTMLCanvasElement; size: number } | null = null // "brick wall" badge
   const paddleSprites: ({ canvas: HTMLCanvasElement; size: number } | null)[] = [null, null]
   let geo: Geo = computeGeo()
   let puck: Matter.Body
@@ -164,6 +183,10 @@ export function createAirHockey(
   let charge: { owner: 0 | 1; sinceMs: number } | null = null
   // invincibility stage 2: a puck is mid-invincible-run (fast, glowing, phases through opponent)
   let invincible: { puck: Matter.Body; owner: 0 | 1; sinceMs: number } | null = null
+  // the "brick" power-up's shield: up to five curved bricks arched over an owner's crease, each
+  // broken by a single puck hit. Persists until smashed or the next face-off clears the board.
+  let bricks: Brick[] = []
+  const brickRemovals = new Set<Matter.Body>() // bricks a puck touched this step, removed after Engine.update
 
   // animation clocks (wall-clock ms, refreshed each frame)
   let nowMs = performance.now()
@@ -368,6 +391,38 @@ export function createAirHockey(
       sc.fillStyle = '#ffffff'
       sc.fill()
     })
+    // brick power-up: the same glowing amber disc stamped with a small dark brick-wall motif
+    bricksSprite = buildSprite(powerUpRadius(), powerUpRadius() * 0.7, (sc, cx, cy, r) => {
+      const grad = sc.createRadialGradient(cx, cy, r * 0.1, cx, cy, r)
+      grad.addColorStop(0, '#ffe9b0')
+      grad.addColorStop(0.6, TOS_YELLOW)
+      grad.addColorStop(1, '#d8930f')
+      sc.beginPath()
+      sc.arc(cx, cy, r, 0, Math.PI * 2)
+      sc.fillStyle = grad
+      sc.shadowColor = 'rgba(247,180,53,0.85)'
+      sc.shadowBlur = r * 0.8
+      sc.fill()
+      sc.shadowBlur = 0
+      // a tidy little wall: three staggered rows of dark bricks with mortar gaps
+      const bw = r * 0.44 // brick width
+      const bh = r * 0.26 // brick height
+      const gap = r * 0.07 // mortar gap
+      const rows = 3
+      sc.fillStyle = PUCK_COLOR
+      for (let row = 0; row < rows; row++) {
+        const y = cy + (row - (rows - 1) / 2) * (bh + gap) - bh / 2
+        const offset = row % 2 === 0 ? 0 : (bw + gap) / 2 // brick-bond stagger
+        for (let k = -1; k <= 1; k++) {
+          const x = cx + k * (bw + gap) + offset - bw / 2
+          // skip the brick that would overflow the disc on staggered rows
+          if (Math.abs(x + bw / 2 - cx) > r * 0.78) continue
+          sc.beginPath()
+          roundRectPath(sc, x, y, bw, bh, bh * 0.18)
+          sc.fill()
+        }
+      }
+    })
     for (const i of [0, 1] as const) {
       const color = i === 0 ? RED : BLUE
       paddleSprites[i] = buildSprite(paddleR, paddleR * 0.4, (sc, cx, cy, r) => {
@@ -477,6 +532,10 @@ export function createAirHockey(
   // ── world construction ────────────────────────────────────────────────────
   function buildWorld() {
     Composite.clear(engine.world, false, true)
+    // Composite.clear just wiped every body, brick walls included — drop their stale references
+    // (a resize rebuilds the world from scratch without restoring shields).
+    bricks = []
+    brickRemovals.clear()
     const { left, right, top, bottom, pw, ph, cx, cy, wall: t, goalLen, cornerR } = geo
     const half = t / 2
     const walls: Matter.Body[] = []
@@ -614,11 +673,13 @@ export function createAirHockey(
     return { minX: left + r, maxX: right - r, minY: cy - ph * 0.17 + r, maxY: cy + ph * 0.17 - r }
   }
 
-  // Choose a power-up kind 50/50 (two-pucks falls back to invincibility when extras are maxed),
+  // Choose a power-up kind uniformly (two-pucks falls back to another kind when extras are maxed),
   // then send it drifting in from a rink edge within the neutral zone at a gentle inward angle.
   function spawnPowerUp() {
-    let kind: PowerKind = Math.random() < 0.5 ? 'two-pucks' : 'invincibility'
-    if (kind === 'two-pucks' && extraPucks.length >= MAX_EXTRA_PUCKS) kind = 'invincibility'
+    const kinds: PowerKind[] = ['two-pucks', 'invincibility', 'brick']
+    let kind = kinds[Math.floor(Math.random() * kinds.length)]
+    // two-pucks falls back to one of the other always-available kinds when extras are maxed
+    if (kind === 'two-pucks' && extraPucks.length >= MAX_EXTRA_PUCKS) kind = Math.random() < 0.5 ? 'invincibility' : 'brick'
     const z = neutralZone()
     const speed = geo.rBase * 0.005 // slow float
     const a = (0.25 + Math.random() * 0.5) * Math.PI // inward heading, 45°–135° off the entry edge
@@ -678,6 +739,85 @@ export function createAirHockey(
     goallessMs = 0
   }
 
+  // ── brick shield ─────────────────────────────────────────────────────────────
+  // The crease arc an owner's bricks sit on — matches drawGoals()/paintCrease() exactly so the
+  // physics wall and the painted crease share one source of truth. Returns the goal center, the
+  // crease radius, and the half-circle sweep (a0→a1) that opens into the ice.
+  function creaseGeom(owner: 0 | 1): { cx: number; cy: number; r: number; a0: number; a1: number } {
+    const { left, right, top, bottom, cx, cy, goalLen } = geo
+    const r = goalLen / 2
+    const HALF = Math.PI / 2
+    if (!geo.portrait) {
+      return owner === 0
+        ? { cx: left, cy, r, a0: -HALF, a1: HALF } // RED goal (left), opens right
+        : { cx: right, cy, r, a0: HALF, a1: 3 * HALF } // BLUE goal (right), opens left
+    }
+    return owner === 0
+      ? { cx, cy: bottom, r, a0: Math.PI, a1: 2 * Math.PI } // RED goal (bottom), opens up
+      : { cx, cy: top, r, a0: 0, a1: Math.PI } // BLUE goal (top), opens down
+  }
+
+  // A static rectangle approximating one brick's arc segment: a chord tangent to the crease arc
+  // at its mid-angle (same construction as buildWorld's addCorner). Tagged 'brick' so the
+  // collision handler can spot a puck striking it.
+  function makeBrickBody(cx: number, cy: number, r: number, a0: number, a1: number, thickness: number): Matter.Body {
+    const mid = (a0 + a1) / 2
+    const chord = 2 * r * Math.sin((a1 - a0) / 2)
+    const b = Bodies.rectangle(cx + Math.cos(mid) * r, cy + Math.sin(mid) * r, chord, thickness, {
+      isStatic: true,
+      restitution: 1,
+      friction: 0,
+      angle: mid + Math.PI / 2,
+    })
+    b.label = 'brick'
+    return b
+  }
+
+  // Raise the five-brick shield over `owner`'s crease (replacing any wall they already have).
+  // The 180° crease sweep is split into five equal segments separated by small mortar gaps.
+  function spawnBricks(owner: 0 | 1) {
+    clearBricks(owner)
+    const { cx, cy, r, a0, a1 } = creaseGeom(owner)
+    const count = 5
+    const span = a1 - a0
+    const gap = span * 0.045 // mortar gap between bricks
+    const seg = (span - gap * (count - 1)) / count
+    const thickness = geo.rBase * 0.022
+    for (let k = 0; k < count; k++) {
+      const s0 = a0 + k * (seg + gap)
+      const s1 = s0 + seg
+      const body = makeBrickBody(cx, cy, r, s0, s1, thickness)
+      Composite.add(engine.world, body)
+      bricks.push({ owner, body, cx, cy, r, a0: s0, a1: s1, broken: false, brokenMs: 0 })
+    }
+  }
+
+  // Remove brick bodies from the world and forget them. With no owner, clears every wall;
+  // with an owner, clears just that player's (used before rebuilding their shield).
+  function clearBricks(owner?: 0 | 1) {
+    for (let k = bricks.length - 1; k >= 0; k--) {
+      if (owner !== undefined && bricks[k].owner !== owner) continue
+      brickRemovals.delete(bricks[k].body)
+      Composite.remove(engine.world, bricks[k].body)
+      bricks.splice(k, 1)
+    }
+  }
+
+  // Any puck (primary, extra, or the invincible one) touching a brick queues it for removal.
+  // We only flag here — the body is removed after Engine.update() so the bounce impulse for this
+  // step still lands first (the brick-breaker "bounce then shatter" feel).
+  function onBrickCollision(ev: Matter.IEventCollision<Matter.Engine>) {
+    if (bricks.length === 0) return
+    for (const pair of ev.pairs) {
+      const a = pair.bodyA.parent
+      const b = pair.bodyB.parent
+      const brick = a.label === 'brick' ? a : b.label === 'brick' ? b : null
+      if (!brick) continue
+      const other = brick === a ? b : a
+      if (other === puck || extraPucks.includes(other)) brickRemovals.add(brick)
+    }
+  }
+
   // ── match flow ──────────────────────────────────────────────────────────────
   // Face-off: drop the puck STILL. It only moves once struck. A new game faces off
   // dead center; post-goal (and re-drops) sit on the receiving player's blue line.
@@ -685,6 +825,7 @@ export function createAirHockey(
     scoreFlash = null
     clearExtraPucks()
     clearPowerUp()
+    clearBricks()
     endInvincible()
     charge = null
     serveToward = toward
@@ -702,6 +843,7 @@ export function createAirHockey(
   function onGoal(scorer: number) {
     clearExtraPucks() // any goal returns the board to a single puck
     clearPowerUp()
+    clearBricks()
     endInvincible()
     charge = null
     scores[scorer]++
@@ -802,6 +944,7 @@ export function createAirHockey(
   function clearBoard() {
     clearExtraPucks()
     clearPowerUp()
+    clearBricks()
     scores[0] = 0
     scores[1] = 0
     winner = -1
@@ -877,6 +1020,23 @@ export function createAirHockey(
 
     Engine.update(engine, PHYS_DT)
 
+    // shatter any bricks a puck struck this step (the bounce impulse already landed above)
+    if (brickRemovals.size) {
+      for (const body of brickRemovals) {
+        const brick = bricks.find((br) => br.body === body)
+        if (brick && !brick.broken) {
+          brick.broken = true
+          brick.brokenMs = nowMs
+          Composite.remove(engine.world, body)
+        }
+      }
+      brickRemovals.clear()
+    }
+    // drop bricks whose shatter flash has finished animating
+    for (let k = bricks.length - 1; k >= 0; k--) {
+      if (bricks[k].broken && nowMs - bricks[k].brokenMs > BRICK_SHATTER_MS) bricks.splice(k, 1)
+    }
+
     // keep paddles inside their halves even after puck impacts
     for (let i = 0; i < 2; i++) {
       const p = paddles[i]
@@ -942,6 +1102,7 @@ export function createAirHockey(
         const p = paddles[i]
         if (Math.hypot(p.position.x - powerUp.x, p.position.y - powerUp.y) < reach) {
           if (powerUp.kind === 'two-pucks') spawnExtraPuck()
+          else if (powerUp.kind === 'brick') spawnBricks(i as 0 | 1) // raise this player's crease shield
           else charge = { owner: i as 0 | 1, sinceMs: nowMs } // arm this paddle for an invincible strike
           clearPowerUp()
           return
@@ -975,6 +1136,7 @@ export function createAirHockey(
 
     drawScoreboard() // per-frame: digits change + brief scale-pop on a goal
     drawPowerUp() // under the pucks/paddles so a scooping paddle renders on top
+    drawBricks() // crease shields, under the pucks so a striking puck renders on top
     drawPuck()
     for (const b of extraPucks) drawPuck(b)
     drawPaddle(0)
@@ -1124,7 +1286,8 @@ export function createAirHockey(
   // The drifting power-up badge: a steady glow ring plus the kind's badge with a gentle pulse,
   // drawn at its current floating position in the neutral zone.
   function drawPowerUp() {
-    const sprite = powerUp?.kind === 'invincibility' ? invincibleSprite : powerUpSprite
+    const sprite =
+      powerUp?.kind === 'invincibility' ? invincibleSprite : powerUp?.kind === 'brick' ? bricksSprite : powerUpSprite
     if (!powerUp || !sprite) return
     const c = ctx!
     const { x, y } = powerUp
@@ -1144,6 +1307,64 @@ export function createAirHockey(
     const size = sprite.size * pulse
     const half = size / 2
     c.drawImage(sprite.canvas, x - half, y - half, size, size)
+  }
+
+  // A curved brick: the annular sector between rInner and rOuter spanning a0→a1 (closed by the
+  // radial ends), giving a true curved tile rather than the flat physics chord behind it.
+  function brickSectorPath(
+    c: CanvasRenderingContext2D,
+    cx: number,
+    cy: number,
+    rInner: number,
+    rOuter: number,
+    a0: number,
+    a1: number,
+  ) {
+    c.beginPath()
+    c.arc(cx, cy, rOuter, a0, a1)
+    c.arc(cx, cy, rInner, a1, a0, true)
+    c.closePath()
+  }
+
+  // The brick shield: each unbroken brick is a glossy team-colored curved tile arched over its
+  // owner's crease; a freshly struck brick plays a quick outward-pushing fade before it's dropped.
+  function drawBricks() {
+    if (bricks.length === 0) return
+    const c = ctx!
+    const half = geo.rBase * 0.026 // visual radial half-thickness — chunky enough to read as a brick
+    for (const br of bricks) {
+      const color = br.owner === 0 ? RED : BLUE
+      const rInner = br.r - half
+      const rOuter = br.r + half
+      if (!br.broken) {
+        c.save()
+        // solid brick body with a soft drop shadow lifting it off the ice
+        brickSectorPath(c, br.cx, br.cy, rInner, rOuter, br.a0, br.a1)
+        c.fillStyle = color
+        c.shadowColor = 'rgba(0,0,0,0.4)'
+        c.shadowBlur = half * 1.1
+        c.fill()
+        c.shadowBlur = 0
+        // crisp dark mortar outline so the five bricks read as distinct tiles
+        c.lineWidth = Math.max(1.5, geo.rBase * 0.004)
+        c.strokeStyle = 'rgba(20,28,42,0.55)'
+        c.stroke()
+        // glossy highlight along the outer half for a beveled, lit-from-outside look
+        brickSectorPath(c, br.cx, br.cy, br.r + half * 0.1, rOuter, br.a0, br.a1)
+        c.fillStyle = 'rgba(255,255,255,0.32)'
+        c.fill()
+        c.restore()
+      } else {
+        const t = clamp((nowMs - br.brokenMs) / BRICK_SHATTER_MS, 0, 1)
+        const push = half * 2.5 * t // band shoves outward as it dissolves
+        c.save()
+        c.globalAlpha = 1 - t
+        brickSectorPath(c, br.cx, br.cy, rInner + push, rOuter + push, br.a0, br.a1)
+        c.fillStyle = t < 0.35 ? '#ffffff' : color // a brief white pop on impact
+        c.fill()
+        c.restore()
+      }
+    }
   }
 
   function drawPaddle(i: number) {
@@ -1542,6 +1763,7 @@ export function createAirHockey(
   buildWorld()
   rebuildStatics()
   reset()
+  Events.on(engine, 'collisionStart', onBrickCollision)
   canvas.addEventListener('pointerdown', onDown)
   canvas.addEventListener('pointermove', onMove)
   canvas.addEventListener('pointerup', onUp)
@@ -1564,6 +1786,7 @@ export function createAirHockey(
     reset,
     destroy() {
       cancelAnimationFrame(raf)
+      Events.off(engine, 'collisionStart', onBrickCollision)
       canvas.removeEventListener('pointerdown', onDown)
       canvas.removeEventListener('pointermove', onMove)
       canvas.removeEventListener('pointerup', onUp)
@@ -1597,6 +1820,9 @@ export function createAirHockey(
     },
     debugGoal(team: 0 | 1) {
       onGoal(team)
+    },
+    debugBricks(team: 0 | 1) {
+      spawnBricks(team)
     },
   }
 }
